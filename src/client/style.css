@@ -1,0 +1,129 @@
+.mono-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  padding: 8px;
+  gap: 8px;
+  box-sizing: border-box;
+}
+
+.mono-toolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.mono-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font: 16px/1 ui-monospace, monospace;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dsh-border, #ddd);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mono-tool-btn:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.mono-tree {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Same box model in both axes: children flex-grow by their share of sizes. */
+.mono-split {
+  display: flex;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mono-cell {
+  display: flex;
+  flex-basis: 0;
+  flex-shrink: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */
+.mono-sash {
+  flex: 0 0 6px;
+  align-self: stretch;
+  background: var(--dsh-border, #ddd);
+  opacity: 0.45;
+  border-radius: 3px;
+}
+
+.mono-sash:hover {
+  opacity: 0.8;
+}
+
+.mono-split[data-mono-dir="row"] > .mono-sash {
+  cursor: col-resize;
+}
+
+.mono-split[data-mono-dir="column"] > .mono-sash {
+  cursor: row-resize;
+}
+
+.mono-pane {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--dsh-border, #ddd);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.mono-pane-active {
+  border-color: var(--dsh-accent, #6a8dff);
+}
+
+.mono-pane-body {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+.mono-pane-head {
+  flex: none;
+  min-width: 0;
+}
+
+/* The host content root is height:100%, so give it a definite flex parent. */
+.mono-pane-content {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mono-pane-content > * {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.mono-empty {
+  padding: 12px;
+  font: 12px ui-monospace, monospace;
+  opacity: 0.6;
+}

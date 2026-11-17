@@ -1,0 +1,5 @@
+# dsh-mono bundle patch: one loader row.
+- insert:
+    - id: mono
+      name: 'dsh-mono'
+      label: 'Mono'
