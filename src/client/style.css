@@ -127,3 +127,116 @@
   font: 12px ui-monospace, monospace;
   opacity: 0.6;
 }
+
+/* ---- tab strip ------------------------------------------------------------ */
+.mono-tabs {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+  padding: 3px 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 1px solid var(--dsh-border, #ddd);
+}
+
+.mono-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.mono-tab {
+  display: flex;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 220px;
+  padding: 2px 3px 2px 8px;
+  font: 12px/1.6 ui-monospace, monospace;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.mono-tab:hover {
+  background: rgba(127, 127, 127, 0.12);
+  opacity: 1;
+}
+
+.mono-tab-active {
+  background: rgba(127, 127, 127, 0.16);
+  border-color: var(--dsh-border, #ddd);
+  opacity: 1;
+}
+
+.mono-tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* preview: transient tab, replaced by the next session opened in this pane. */
+.mono-tab-preview .mono-tab-title {
+  font-style: italic;
+}
+
+.mono-tab-close,
+.mono-tab-add {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  font: 12px/1 ui-monospace, monospace;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+
+.mono-tab-close:hover,
+.mono-tab-add:hover {
+  background: rgba(127, 127, 127, 0.24);
+  opacity: 1;
+}
+
+.mono-tab-add {
+  width: 20px;
+  height: 20px;
+  font-size: 14px;
+}
+
+/* Empty pane: the tab strip stays, the pane shows where to start. */
+.mono-pane-empty {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 0;
+}
+
+.mono-pane-empty-title {
+  font: 12px ui-monospace, monospace;
+  opacity: 0.55;
+}
+
+.mono-pane-empty-btn {
+  padding: 4px 12px;
+  font: 12px/1.4 ui-monospace, monospace;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dsh-border, #ddd);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.mono-pane-empty-btn:hover {
+  background: rgba(127, 127, 127, 0.12);
+}

@@ -633,6 +633,254 @@ window.__ModuleLoader__.load({
         });
     }
 
+    // ---- workspace state (page level) ------------------------------------------
+    // The host mounts exactly one main-panel entry at a time, and every session
+    // open from its sidebar reveals the Conversation (layout.selectPanel(null)).
+    // Switching panels unmounts MonoRoot, so tab state cannot live in component
+    // state: it lives here, outside React, and survives leaving the panel.
+    //
+    // Shape:
+    //   { tree, active,
+    //     panes: { [paneId]: { tabs: [{ sessionId, preview }], activeIndex } } }
+    // T03 wrote panes[paneId] = sessionId | null. paneOf() upgrades that on read,
+    // so an old in-memory object (or, from T06, a stored one) keeps working.
+    //
+    // preview: a transient tab — opening another session in the same pane replaces
+    // it instead of appending. Double-click or the first message promotes it.
+
+    let workspaceState = null;
+    let hostSelection = null;
+    const workspaceListeners = new Set();
+
+    const emptyPane = () => ({ tabs: [], activeIndex: 0 });
+
+    const clampIndex = (index, length) => {
+      if (length <= 0) return 0;
+      const value = Number.isFinite(index) ? Math.floor(index) : 0;
+      return value < 0 ? 0 : value > length - 1 ? length - 1 : value;
+    };
+
+    /** One pane, upgraded from the T03 shape when needed. */
+    function paneOf(panes, paneId) {
+      const pane = panes?.[paneId];
+      if (pane !== null && typeof pane === "object" && Array.isArray(pane.tabs)) {
+        return { tabs: pane.tabs, activeIndex: clampIndex(pane.activeIndex, pane.tabs.length) };
+      }
+      const sessionId = typeof pane === "string" && pane !== "" ? pane : null;
+      return sessionId === null
+        ? emptyPane()
+        : { tabs: [{ sessionId, preview: false }], activeIndex: 0 };
+    }
+
+    /** All sessions the layout shows, in pane order (the retain set). */
+    function paneSessionIds(panes) {
+      const ids = [];
+      for (const paneId of Object.keys(panes ?? {})) {
+        for (const tab of paneOf(panes, paneId).tabs) ids.push(tab.sessionId);
+      }
+      return ids;
+    }
+
+    // ---- pane edits (pure: pane in, pane out, null when nothing changed) --------
+    function openTabInPane(pane, sessionId, preview) {
+      const index = pane.tabs.findIndex((tab) => tab.sessionId === sessionId);
+      // Already open here: focus it. Switching tabs must not touch preview state.
+      if (index >= 0) return index === pane.activeIndex ? null : { ...pane, activeIndex: index };
+      const tab = { sessionId, preview: preview === true };
+      if (tab.preview) {
+        // One preview slot per pane: the next open takes the existing slot over.
+        const slot = pane.tabs.findIndex((candidate) => candidate.preview);
+        if (slot >= 0) {
+          const tabs = pane.tabs.slice();
+          tabs[slot] = tab;
+          return { tabs, activeIndex: slot };
+        }
+      }
+      const tabs = pane.tabs.concat([tab]);
+      return { tabs, activeIndex: tabs.length - 1 };
+    }
+
+    function closeTabAt(pane, index) {
+      if (index < 0 || index >= pane.tabs.length) return null;
+      const tabs = pane.tabs.slice(0, index).concat(pane.tabs.slice(index + 1));
+      if (tabs.length === 0) return emptyPane();
+      const activeIndex = index < pane.activeIndex ? pane.activeIndex - 1
+        : index === pane.activeIndex ? Math.min(index, tabs.length - 1) : pane.activeIndex;
+      return { tabs, activeIndex };
+    }
+
+    function promoteTabAt(pane, index) {
+      const tab = pane.tabs[index];
+      if (tab === undefined || tab.preview !== true) return null;
+      const tabs = pane.tabs.slice();
+      tabs[index] = { ...tab, preview: false };
+      return { tabs, activeIndex: pane.activeIndex };
+    }
+
+    // ---- store -----------------------------------------------------------------
+    function workspaceGet() { return workspaceState; }
+
+    function workspaceSubscribe(listener) {
+      workspaceListeners.add(listener);
+      return () => { workspaceListeners.delete(listener); };
+    }
+
+    function workspaceUpdate(updater) {
+      const previous = workspaceState;
+      if (previous === null) return;
+      const next = updater(previous);
+      if (next === null || next === undefined || next === previous) return;
+      workspaceState = next;
+      for (const listener of Array.from(workspaceListeners)) {
+        try { listener(); } catch (error) { log("workspace listener failed", String(error)); }
+      }
+    }
+
+    /** The one pane every layout starts with. Called during render; no notify. */
+    function workspaceStart(paneId, sessionId) {
+      if (workspaceState !== null) return workspaceState;
+      workspaceState = {
+        tree: leaf(paneId),
+        panes: { [paneId]: sessionId ? { tabs: [{ sessionId, preview: false }], activeIndex: 0 } : emptyPane() },
+        active: paneId,
+      };
+      return workspaceState;
+    }
+
+    /** Last Session the host showed (retained as mainView), if seen. */
+    function workspaceHostSelection() { return hostSelection; }
+
+    function workspaceNoteHostSelection(sessionId) {
+      if (typeof sessionId === "string" && sessionId !== "") hostSelection = sessionId;
+    }
+
+    function workspaceActivePane() { return workspaceState?.active ?? null; }
+
+    function workspaceUpdatePane(paneId, change) {
+      workspaceUpdate((previous) => {
+        if (typeof paneId !== "string") return previous;
+        const pane = paneOf(previous.panes, paneId);
+        const next = change(pane);
+        if (next === null) return previous;
+        return { ...previous, panes: { ...previous.panes, [paneId]: next } };
+      });
+    }
+
+    function workspaceOpenTab(paneId, sessionId, options) {
+      if (typeof sessionId !== "string" || sessionId === "") return;
+      const target = typeof paneId === "string" ? paneId : workspaceActivePane();
+      if (target === null) return;
+      workspaceUpdate((previous) => {
+        const pane = paneOf(previous.panes, target);
+        const next = openTabInPane(pane, sessionId, options?.preview === true);
+        // Focus the pane even when the tab itself was already showing: an open
+        // request names the pane it lands in.
+        return { ...previous, active: target, panes: { ...previous.panes, [target]: next ?? pane } };
+      });
+    }
+
+    function workspaceCloseTab(paneId, index) {
+      workspaceUpdatePane(paneId, (pane) => closeTabAt(pane, index));
+    }
+
+    function workspaceActivateTab(paneId, index) {
+      workspaceUpdatePane(paneId, (pane) => (
+        index === pane.activeIndex || index < 0 || index >= pane.tabs.length
+          ? null
+          : { tabs: pane.tabs, activeIndex: index }
+      ));
+    }
+
+    function workspacePromoteTab(paneId, index) {
+      workspaceUpdatePane(paneId, (pane) => promoteTabAt(pane, index));
+    }
+
+    /** Promote every preview tab showing this session (a message was sent). */
+    function workspacePromoteSession(sessionId) {
+      workspaceUpdate((previous) => {
+        let changed = false;
+        const panes = { ...previous.panes };
+        for (const paneId of Object.keys(previous.panes)) {
+          const pane = paneOf(previous.panes, paneId);
+          const index = pane.tabs.findIndex((tab) => tab.sessionId === sessionId && tab.preview);
+          if (index < 0) continue;
+          panes[paneId] = promoteTabAt(pane, index) ?? pane;
+          changed = true;
+        }
+        return changed ? { ...previous, panes } : previous;
+      });
+    }
+
+    function workspaceSetActivePane(paneId) {
+      workspaceUpdate((previous) => (previous.active === paneId ? previous : { ...previous, active: paneId }));
+    }
+
+    /** Split: the new pane opens empty — it must not copy the neighbour's tabs. */
+    function workspaceSplit(paneId, newPaneId) {
+      workspaceUpdate((previous) => ({
+        tree: splitPane(previous.tree, paneId, "row", newPaneId),
+        panes: { ...previous.panes, [newPaneId]: emptyPane() },
+        active: newPaneId,
+      }));
+    }
+
+    // ---- self-check: node src/client/state/workspace.js -------------------------
+    function workspaceSelfCheck(assert) {
+      const tab = (sessionId, preview) => ({ sessionId, preview });
+
+      // T03 shape (one id per pane) upgrades to a tab list.
+      assert.deepEqual(paneOf({ a: "s1" }, "a"), { tabs: [tab("s1", false)], activeIndex: 0 });
+      assert.deepEqual(paneOf({ a: null }, "a"), emptyPane());
+      assert.deepEqual(paneOf({}, "a"), emptyPane());
+
+      // A second session in the same pane replaces the preview instead of appending.
+      const one = openTabInPane(emptyPane(), "s1", true);
+      assert.deepEqual(one, { tabs: [tab("s1", true)], activeIndex: 0 });
+      const two = openTabInPane(one, "s2", true);
+      assert.deepEqual(two, { tabs: [tab("s2", true)], activeIndex: 0 });
+      // ...but a permanent tab is appended next to it.
+      const both = openTabInPane(two, "s3", false);
+      assert.deepEqual(both, { tabs: [tab("s2", true), tab("s3", false)], activeIndex: 1 });
+      // Switching back to an open session only moves the cursor.
+      assert.deepEqual(openTabInPane(both, "s2", true), { tabs: both.tabs, activeIndex: 0 });
+      assert.equal(openTabInPane(both, "s3", true), null);
+
+      // Promotion clears the flag once.
+      const promoted = promoteTabAt(both, 0);
+      assert.deepEqual(promoted, { tabs: [tab("s2", false), tab("s3", false)], activeIndex: 1 });
+      assert.equal(promoteTabAt(promoted, 0), null);
+
+      // Closing the active tab picks a neighbour; closing the last keeps the pane.
+      assert.deepEqual(closeTabAt(both, 1), { tabs: [tab("s2", true)], activeIndex: 0 });
+      assert.deepEqual(closeTabAt(both, 0), { tabs: [tab("s3", false)], activeIndex: 0 });
+      assert.deepEqual(closeTabAt(one, 0), emptyPane());
+
+      // activeIndex survives an out-of-range value from a stored layout.
+      assert.equal(paneOf({ a: { tabs: [tab("s1", false)], activeIndex: 7 } }, "a").activeIndex, 0);
+      assert.equal(paneOf({ a: { tabs: [], activeIndex: 3 } }, "a").activeIndex, 0);
+
+      // The retain set follows every tab of every pane, not just the active ones.
+      assert.deepEqual(
+        paneSessionIds({ a: { tabs: [tab("s1", false), tab("s2", true)], activeIndex: 0 }, b: "s3" }),
+        ["s1", "s2", "s3"],
+      );
+      console.log("  ok workspace state checks");
+    }
+
+    const isDirectWorkspaceRun = typeof process !== "undefined"
+      && typeof window === "undefined"
+      && typeof document === "undefined"
+      && /(^|[\\/])workspace\.js$/.test(process.argv?.[1] ?? "");
+
+    if (isDirectWorkspaceRun) {
+      import("node:assert/strict")
+        .then(({ default: assert }) => workspaceSelfCheck(assert))
+        .catch((error) => {
+          console.error(error);
+          process.exitCode = 1;
+        });
+    }
+
     // ---- session reference plumbing ---------------------------------------------
     // Retain handles are shared per session id and ref-counted: N panes showing the
     // same session keep exactly one retain.
@@ -700,20 +948,19 @@ window.__ModuleLoader__.load({
       return { reference, status: reference === undefined ? "pending" : "ready" };
     }
 
-    /** Session ids from the host's list observable (falls back to the controller's). */
-    function useSessionIds(list) {
-      const ids = react.useSyncExternalStore(
+    /**
+     * Whole session-list snapshot (ids, byId rows with title/displayTitle/retainedBy).
+     * Same store the host's own sidebar renders from: the tab strip reads titles out
+     * of it, and the host-selection watch reads retainedBy.
+     */
+    const EMPTY_SESSION_LIST = Object.freeze({ ids: [], byId: {} });
+
+    function useSessionList(list) {
+      return react.useSyncExternalStore(
         (callback) => { try { return list?.subscribe?.(callback) ?? (() => {}); } catch { return () => {}; } },
-        () => {
-          try {
-            const snapshot = list?.getSnapshot?.();
-            const array = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
-            return JSON.stringify(array.slice(0, 6));
-          } catch { return "[]"; }
-        },
-        () => "[]",
+        () => { try { return list?.getSnapshot?.() ?? EMPTY_SESSION_LIST; } catch { return EMPTY_SESSION_LIST; } },
+        () => EMPTY_SESSION_LIST,
       );
-      return react.useMemo(() => { try { return JSON.parse(ids); } catch { return []; } }, [ids]);
     }
 
     // ---- one pane: the native conversation in its own SessionProvider -----------
@@ -768,14 +1015,13 @@ window.__ModuleLoader__.load({
       const { sessionId, sessions, renderSlot, renderFactorySlot, SessionProvider } = props;
       // Hooks run unconditionally: useSessionReference sits above every early return.
       const { reference, status } = useSessionReference(sessions, sessionId);
+      // A preview tab is promoted page-side from the session list's updatedAt
+      // (index.js watchPreviewUse): the prompt that promotes it usually goes to the
+      // host's own Conversation panel, which unmounts this one.
       if (typeof renderFactorySlot !== "function") return h("div", { className: "mono-empty" }, "no renderFactorySlot");
       if (sessions === undefined) return h("div", { className: "mono-empty" }, "no sessions service");
-      // No session yet: the host's own hero/new-chat surface, unwrapped. The header
-      // is session-scoped, so it only exists once the pane has a real session.
-      if (sessionId === null || sessionId === undefined || sessionId === "") {
-        return h("div", { className: "mono-pane-hero" },
-          renderFactorySlot(CONTENT_FACTORY, { variant: "embedded", phase: "hero", hero: true }));
-      }
+      // A pane with no tab renders PaneEmpty in PaneTree, not this component, so a
+      // session id always arrives here; a stale one still degrades to "no binding".
       if (reference === undefined) {
         return h("div", { className: "mono-empty" }, status === "pending" ? "opening session..." : "no binding");
       }
@@ -794,15 +1040,101 @@ window.__ModuleLoader__.load({
               renderFactorySlot(CONTENT_FACTORY, { variant: "embedded", phase: "active" })))));
     }
 
+    // ---- tab strip: one tab per session in a pane -------------------------------
+    // A tab's label is the host's own displayTitle (durable title, else workspace
+    // basename, else id). The tab strip exists because the native session header is
+    // not obtainable from a third-party pane (Pane.js / plan.md decision 9).
+    function tabTitle(byId, sessionId) {
+      const row = byId?.[sessionId];
+      if (typeof row?.title === "string" && row.title !== "") return row.title;
+      if (typeof row?.displayTitle === "string" && row.displayTitle !== "") return row.displayTitle;
+      return sessionId.slice(0, 8);
+    }
+
+    /**
+     * Tabs are divs, not buttons: each one carries its own close button and nesting
+     * buttons is invalid. role=tab + key handling keeps them operable from the
+     * keyboard; middle click closes, like a browser tab.
+     *
+     * data-mono-preview / .mono-tab-preview is the transient state: italic title,
+     * replaced by the next session opened in this pane, promoted on double click,
+     * Enter, or the first prompt sent inside it.
+     */
+    function TabStrip(props) {
+      const { paneId, pane, byId } = props;
+      const items = pane.tabs.map((tab, index) => {
+        const title = tabTitle(byId, tab.sessionId);
+        const active = index === pane.activeIndex;
+        return h("div", {
+          key: tab.sessionId,
+          className: "mono-tab"
+            + (active ? " mono-tab-active" : "")
+            + (tab.preview ? " mono-tab-preview" : ""),
+          role: "tab",
+          tabIndex: active ? 0 : -1,
+          "aria-selected": active,
+          "aria-label": title,
+          title,
+          "data-mono-tab": tab.sessionId,
+          "data-mono-preview": tab.preview ? "true" : "false",
+          onMouseDown: (event) => {
+            if (event.button !== 0) return;
+            props.onActivateTab(paneId, index);
+          },
+          onAuxClick: (event) => {
+            if (event.button === 1) props.onCloseTab(paneId, index);
+          },
+          onDoubleClick: () => props.onPromoteTab(paneId, index),
+          onKeyDown: (event) => {
+            if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.onActivateTab(paneId, index); }
+            else if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); props.onCloseTab(paneId, index); }
+          },
+        },
+          h("span", { className: "mono-tab-title" }, title),
+          h("button", {
+            type: "button",
+            className: "mono-tab-close",
+            title: "Close tab",
+            "aria-label": "Close " + title,
+            onMouseDown: (event) => event.stopPropagation(),
+            onClick: (event) => { event.stopPropagation(); props.onCloseTab(paneId, index); },
+          }, "\u00d7"));
+      });
+      items.push(h("button", {
+        key: "new-tab",
+        type: "button",
+        className: "mono-tab-add",
+        title: "New session",
+        "aria-label": "New session",
+        "data-mono-tab-add": paneId,
+        onMouseDown: (event) => event.stopPropagation(),
+        onClick: () => props.onOpenSession(paneId),
+      }, "+"));
+      return h("div", { className: "mono-tabs", role: "tablist", "data-mono-tabs": paneId }, items);
+    }
+
     // ---- split tree -> flex boxes ----------------------------------------------
     /**
      * Renders the layout tree from layout/tree.js. A split is a flex container in
-     * its own direction; each child gets flex-grow = its share of `sizes`. Leaf
+     * its own direction; each child gets flex-grow = its share of \`sizes\`. Leaf
      * cells render one Pane each, separated by a visible (not yet draggable) sash.
      */
     function PaneTree(props) {
       return h("div", { className: "mono-tree" },
         h(PaneNode, { ...props, node: props.tree }));
+    }
+
+    /** A pane whose last tab was closed: the pane stays, the session does not. */
+    function PaneEmpty(props) {
+      return h("div", { className: "mono-pane-empty", "data-mono-empty": props.paneId },
+        h("div", { className: "mono-pane-empty-title" }, "从这里开始"),
+        h("button", {
+          type: "button",
+          className: "mono-pane-empty-btn",
+          title: "Open session",
+          "aria-label": "Open session",
+          onClick: () => props.onOpenSession(props.paneId),
+        }, "打开会话"));
     }
 
     function PaneNode(props) {
@@ -812,6 +1144,9 @@ window.__ModuleLoader__.load({
       if (node.type === "leaf") {
         const paneId = node.paneId;
         const active = props.activePaneId === paneId;
+        // panes can still hold the T03 shape; paneOf upgrades it on read.
+        const pane = paneOf(props.panes, paneId);
+        const tab = pane.tabs[pane.activeIndex];
         return h("div", {
           className: active ? "mono-pane mono-pane-active" : "mono-pane",
           "data-mono-pane": paneId,
@@ -819,13 +1154,27 @@ window.__ModuleLoader__.load({
             if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
           },
         },
-          h(Pane, {
-            sessionId: props.panes?.[paneId] ?? null,
-            sessions: props.sessions,
-            renderSlot: props.renderSlot,
-            renderFactorySlot: props.renderFactorySlot,
-            SessionProvider: props.SessionProvider,
-          }));
+          h(TabStrip, {
+            paneId,
+            pane,
+            byId: props.byId,
+            onActivateTab: props.onActivateTab,
+            onCloseTab: props.onCloseTab,
+            onPromoteTab: props.onPromoteTab,
+            onOpenSession: props.onOpenSession,
+          }),
+          tab === undefined
+            ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
+            : h(Pane, {
+              // key: switching tabs must remount the native conversation, otherwise
+              // the SessionProvider keeps the old session's scope.
+              key: tab.sessionId,
+              sessionId: tab.sessionId,
+              sessions: props.sessions,
+              renderSlot: props.renderSlot,
+              renderFactorySlot: props.renderFactorySlot,
+              SessionProvider: props.SessionProvider,
+            }));
       }
 
       const count = node.children.length;
@@ -865,7 +1214,7 @@ window.__ModuleLoader__.load({
     const PERSIST_KEY = "dsh-mono:workspace:v1";
 
     /** CSS text, inlined from src/client/style.css. */
-    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n";
+    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n";
 
     // ---- plugin root -----------------------------------------------------------
     /** Services resolve lazily: cordis may materialise them after apply() ran. */
@@ -899,39 +1248,116 @@ window.__ModuleLoader__.load({
     let paneSeq = 0;
     const nextPaneId = () => "pane-" + ++paneSeq;
 
-    /** The main-slot panel body: a layout tree whose leaves are native conversations. */
+    /**
+     * The host's own session open is not ours to observe: uiWorkspace.openSession
+     * reveals the Conversation main panel (layout.selectPanel(null)), which unmounts
+     * this one. Its side effects stay visible, and they are what the tab strip
+     * mirrors:
+     *  - the opened Session is retained with source "mainView" for as long as it is
+     *    the host's selection, and the list republishes retainedBy on every retain,
+     *    so a new mainView id means "the user just opened a session";
+     *  - the prompt sent inside it moves that session's own snapshot, which Pane
+     *    reports as a use (see watchPreviewUse below).
+     * It never calls layout.selectPanel("mono") to yank the user back: Mono is an
+     * addition to the host UI, not a replacement (plan.md decision 1).
+     */
+    // Preview tabs promote when the session is actually used. A session opened from
+    // the sidebar is prompted in the host's own Conversation panel (opening it
+    // reveals Conversation and unmounts this one), so the signal cannot live in a
+    // mounted Pane: it is the session list's updatedAt — the durable message
+    // timestamp manager.handleSessionActivity publishes on every message. Baselines
+    // are taken the moment the preview tab exists, so opening a session that already
+    // has history does not promote it.
+    const previewBaselines = new Map();
+    function watchPreviewUse(snapshot) {
+      const state = workspaceGet();
+      if (state === null) return;
+      const previews = new Set();
+      for (const paneId of Object.keys(state.panes)) {
+        for (const tab of paneOf(state.panes, paneId).tabs) {
+          if (tab.preview) previews.add(tab.sessionId);
+        }
+      }
+      for (const sessionId of previews) {
+        const updatedAt = snapshot?.byId?.[sessionId]?.updatedAt;
+        if (typeof updatedAt !== "number") continue;
+        const baseline = previewBaselines.get(sessionId);
+        // The first row after an open can be a stale re-projection (updatedAt from
+        // the local index, then the live one). Anchoring the baseline at the open
+        // moment keeps that delta from reading as a message; only a timestamp newer
+        // than the moment the tab opened is one.
+        if (baseline === undefined) { previewBaselines.set(sessionId, Math.max(updatedAt, Date.now())); continue; }
+        if (updatedAt > baseline) {
+          previewBaselines.set(sessionId, updatedAt);
+          workspacePromoteSession(sessionId);
+        }
+      }
+      for (const sessionId of Array.from(previewBaselines.keys())) {
+        if (!previews.has(sessionId)) previewBaselines.delete(sessionId);
+      }
+    }
+
+    let watching = false;
+    function watchSessions(sessions, attempts = 0) {
+      if (watching) return;
+      const list = sessions?.list;
+      if (list === undefined || typeof list.subscribe !== "function") {
+        if (attempts < 40) setTimeout(() => watchSessions(sessions, attempts + 1), 250);
+        return;
+      }
+      watching = true;
+      let host = null;
+      const scan = () => {
+        let snapshot;
+        try { snapshot = list.getSnapshot(); } catch { return; }
+        const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
+        const byId = snapshot?.byId ?? {};
+        // ponytail: first positive mainView in list order covers the instant the
+        // host holds two (retain new, then release old); the next scan settles it.
+        const opened = ids.find((id) => (byId[id]?.retainedBy?.mainView ?? 0) > 0);
+        if (opened === undefined) return;
+        if (host !== null && opened !== host) {
+          workspaceOpenTab(workspaceActivePane(), opened, { preview: true });
+        }
+        host = opened;
+        workspaceNoteHostSelection(opened);
+        // After the open request, so a tab created by this scan has its baseline.
+        watchPreviewUse(snapshot);
+      };
+      try { list.subscribe(scan); } catch (error) {
+        log("session watch failed", String(error));
+        watching = false;
+        return;
+      }
+      scan(); // baseline: the current selection is not a new open
+    }
+
+    /** Session the first pane starts with: the host's last pick, else the newest. */
+    function initialSessionId(listState) {
+      const remembered = workspaceHostSelection();
+      if (typeof remembered === "string" && listState?.byId?.[remembered] !== undefined) return remembered;
+      const ids = Array.isArray(listState?.ids) ? listState.ids : [];
+      return ids[0] ?? null;
+    }
+
+    /** The main-slot panel body: a layout tree whose leaves are tab strips. */
     function MonoRoot(props) {
       const sessions = service("sessions");
-      const sessionIds = useSessionIds(props.sessions ?? sessions?.list);
-      // One pane to start. Persistence is T06; until then the layout dies with the page.
-      const [layout, setLayout] = react.useState(() => {
-        const paneId = nextPaneId();
-        return { tree: leaf(paneId), panes: { [paneId]: sessionIds[0] ?? null }, active: paneId };
-      });
+      const listState = useSessionList(props.sessions ?? sessions?.list);
+      // Page-level store: the host unmounts this panel whenever it reveals one of
+      // its own, and the tabs have to survive that (state/workspace.js).
+      const layout = react.useSyncExternalStore(workspaceSubscribe, workspaceGet, workspaceGet)
+        ?? workspaceStart(nextPaneId(), initialSessionId(listState));
 
-      // The session list can arrive after first paint; fill still-blank panes once
-      // it does. A pane's session is state (T04 makes it a tab list), not an index.
-      react.useEffect(() => {
-        if (sessionIds.length === 0) return;
-        setLayout((prev) => {
-          let changed = false;
-          const panes = { ...prev.panes };
-          for (const paneId of Object.keys(panes)) {
-            if (panes[paneId] === null) { panes[paneId] = sessionIds[0]; changed = true; }
-          }
-          return changed ? { ...prev, panes } : prev;
-        });
-      }, [sessionIds]);
+      react.useEffect(() => { watchSessions(service("sessions")); }, []);
 
-      const layoutRef = react.useRef(layout);
-      layoutRef.current = layout;
-
-      // Hold every session the layout shows at the root as well as in its pane.
+      // Hold every session the layout shows — every tab of every pane, not just the
+      // active one — so switching tabs or splitting never resolves no binding.
       // Splitting moves a pane into a new parent, so React remounts it: without a
       // root-level hold the pane's own retain is released before the remounted one
-      // acquires, the native conversation briefly resolves no binding, and its
-      // input shell throws. Ref-counting in session/reference.js makes this free.
-      const heldKey = Object.values(layout.panes).filter((id) => typeof id === "string" && id !== "").sort().join(",");
+      // acquires, the native conversation briefly resolves no binding, and its input
+      // shell throws. Ref-counting in session/reference.js makes this free.
+      const heldKey = Array.from(new Set(paneSessionIds(layout.panes))).sort().join(",");
       const heldRef = react.useRef(new Set());
       react.useEffect(() => {
         if (sessions === undefined || heldKey === "") return;
@@ -946,25 +1372,15 @@ window.__ModuleLoader__.load({
         // per page load. Add release bookkeeping if session churn ever matters.
       }, [sessions, heldKey]);
 
-      const addPane = (paneId, sessionId) => setLayout((prev) => ({
-        tree: splitPane(prev.tree, prev.active, "row", paneId),
-        panes: { ...prev.panes, [paneId]: sessionId ?? null },
-        active: paneId,
-      }));
-
-      const splitActive = () => {
-        const paneId = nextPaneId();
-        const current = layoutRef.current;
-        const used = new Set(Object.values(current.panes));
-        const free = sessionIds.find((id) => !used.has(id));
-        if (free !== undefined) { addPane(paneId, free); return; }
-        // No spare session: ask the host for a fresh one, so the new pane opens a
-        // real conversation instead of mirroring the neighbour. T04 gives it tabs.
-        if (typeof sessions?.create !== "function") { addPane(paneId, current.panes[current.active]); return; }
-        sessions.create({}).then((id) => addPane(paneId, id), (error) => {
-          log("new session failed", String(error?.message ?? error));
-          addPane(paneId, null);
-        });
+      // "+" in a pane, or the empty pane's button: a fresh session, opened permanent
+      // (an explicit create is not a preview) in the pane it was asked for.
+      const openNewSession = (paneId) => {
+        const target = typeof paneId === "string" ? paneId : layout.active;
+        if (typeof sessions?.create !== "function") { log("no sessions.create"); return; }
+        Promise.resolve(sessions.create({})).then(
+          (id) => workspaceOpenTab(target, id, {}),
+          (error) => log("new session failed", String(error?.message ?? error)),
+        );
       };
 
       return h("div", { className: "mono-root" },
@@ -974,14 +1390,18 @@ window.__ModuleLoader__.load({
             className: "mono-tool-btn",
             title: "Split right",
             "aria-label": "Split right",
-            onClick: splitActive,
+            onClick: () => workspaceSplit(layout.active, nextPaneId()),
           }, "+")),
         h(PaneTree, {
           tree: layout.tree,
           panes: layout.panes,
+          byId: listState?.byId,
           activePaneId: layout.active,
-          onActivate: (paneId) =>
-            setLayout((prev) => (prev.active === paneId ? prev : { ...prev, active: paneId })),
+          onActivate: workspaceSetActivePane,
+          onActivateTab: workspaceActivateTab,
+          onCloseTab: workspaceCloseTab,
+          onPromoteTab: workspacePromoteTab,
+          onOpenSession: openNewSession,
           sessions,
           renderSlot: props.renderSlot,
           renderFactorySlot: props.renderFactorySlot,
@@ -994,8 +1414,8 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         CTX = ctx;
         ensureStyle();
-        // The `children` declaration is load-bearing: it is what makes the host
-        // hand this panel `SessionProvider` and `renderFactorySlot`. Drop it and
+        // The \`children\` declaration is load-bearing: it is what makes the host
+        // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
         // the panes render the "no SessionProvider" fallback. Cost: with a dead
         // gateway (server restarted under a live page) the host's teardown render
         // of that session-scoped child throws SlotAssemblyError — host noise, no

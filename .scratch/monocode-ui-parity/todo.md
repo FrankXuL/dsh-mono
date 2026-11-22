@@ -179,7 +179,7 @@ git push
 
 ---
 
-### [ ] T04 — 每栏标签条 + preview 临时态
+### [x] T04 — 每栏标签条 + preview 临时态
 
 **目标**：每栏一条标签，一标签一会话，带 preview 替换与转正。
 
@@ -213,6 +213,14 @@ git push
 
 完成后：报告标签状态的数据结构、preview 替换的判定逻辑、以及你如何处理"从侧栏点开"这个入口。
 ```
+
+**完成** 2026-11-22
+
+产物：`src/client/state/workspace.js`（页面级布局 store：`panes: {[paneId]: {tabs:[{sessionId, preview}], activeIndex}}`，T03 的 `{[paneId]: sessionId}` 读取时升级；preview/replace/close/promote 纯函数 + 自检）、`src/client/panes/TabStrip.js`（标签条，标题 title→displayTitle→id 前 8 位）、`src/client/panes/PaneTree.js`（叶子 = 标签条 + 空态）、`src/client/panes/Pane.js`、`src/client/session/reference.js`（`useSessionList`）、`src/client/index.js`（页级 watch：侧栏 mainView 选择 → preview 标签；updatedAt 走时 → 转正；`heldKey` 覆盖所有栏的所有标签）、`src/client/style.css`（标签/空态样式）、`scripts/build.mjs`（MODULES 加入 `state/workspace.js`、`panes/TabStrip.js`）、`client.js`（67913 bytes）。
+
+验证（一次性 profile `/tmp/t04home` + 无头 Chrome CDP，桌面 profile 未动）：连点 5 个侧栏会话，每次读到的都是 2 个标签（1 常驻 + 1 preview）、`previews:1`，preview 标签 `class="mono-tab mono-tab-active mono-tab-preview"` / `data-mono-preview="true"` / `font-style:italic`，标题依次被替换（ksfloan → kspay-ui → [#00] 前端 → kspay-orbit → [#00] 双通道）；双击 preview → `data-mono-preview="false"`、去掉 `mono-tab-preview`、`font-style:normal`；在 preview 标签的输入框发消息（本轮因额度用尽失败，但消息已落盘）→ 同样转正；逐个关掉两个标签 → `panes:1`、空标签条 + `[data-mono-empty]` 文案「从这里开始 / 打开会话」；「Split right」→ `panes:2`、两条标签条、新栏 `tabs:[]` + 空态，不继承邻居标签。控制台 0 条 `[mono]` 输出、0 个未捕获异常。
+
+**已知限制**：① 侧栏点开会切走宿主主栏（`layout.selectPanel(null)` 会卸载 MonoRoot），所以侧栏入口只能"镜像"出 preview 标签，不劫持宿主——Mono 不调用 `selectPanel('mono')` 把用户拽回来（plan.md 决策 1：补充件，宿主 UI 一行不动）；也因此"在 preview 标签里发消息"通常发生在宿主的 Conversation 里，转正靠会话列表的 `updatedAt`（`manager.handleSessionActivity` 落盘时间戳），而不是栏内 React 状态。② 首次扫到的 `updatedAt` 可能是本地索引的旧值，baseline 用 `max(updatedAt, Date.now())` 锚定打开时刻，否则一次陈旧重投影会被误判成"发了消息"。③ 会话没有选模型时，发送按钮可点但静默不发（无 `updatedAt` 变化），因此那种会话里的发送不会转正——这是宿主行为，不是标签逻辑。④ 无标签时会话仍被页面级 retain 持有（`heldRef` 只增不减，同 T03 已知权衡）。
 
 ---
 

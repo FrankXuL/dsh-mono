@@ -50,14 +50,13 @@ function Pane(props) {
   const { sessionId, sessions, renderSlot, renderFactorySlot, SessionProvider } = props;
   // Hooks run unconditionally: useSessionReference sits above every early return.
   const { reference, status } = useSessionReference(sessions, sessionId);
+  // A preview tab is promoted page-side from the session list's updatedAt
+  // (index.js watchPreviewUse): the prompt that promotes it usually goes to the
+  // host's own Conversation panel, which unmounts this one.
   if (typeof renderFactorySlot !== "function") return h("div", { className: "mono-empty" }, "no renderFactorySlot");
   if (sessions === undefined) return h("div", { className: "mono-empty" }, "no sessions service");
-  // No session yet: the host's own hero/new-chat surface, unwrapped. The header
-  // is session-scoped, so it only exists once the pane has a real session.
-  if (sessionId === null || sessionId === undefined || sessionId === "") {
-    return h("div", { className: "mono-pane-hero" },
-      renderFactorySlot(CONTENT_FACTORY, { variant: "embedded", phase: "hero", hero: true }));
-  }
+  // A pane with no tab renders PaneEmpty in PaneTree, not this component, so a
+  // session id always arrives here; a stale one still degrades to "no binding".
   if (reference === undefined) {
     return h("div", { className: "mono-empty" }, status === "pending" ? "opening session..." : "no binding");
   }

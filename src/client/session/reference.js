@@ -65,18 +65,18 @@ function useSessionReference(sessions, sessionId) {
   return { reference, status: reference === undefined ? "pending" : "ready" };
 }
 
-/** Session ids from the host's list observable (falls back to the controller's). */
-function useSessionIds(list) {
-  const ids = react.useSyncExternalStore(
+/**
+ * Whole session-list snapshot (ids, byId rows with title/displayTitle/retainedBy).
+ * Same store the host's own sidebar renders from: the tab strip reads titles out
+ * of it, and the host-selection watch reads retainedBy.
+ */
+const EMPTY_SESSION_LIST = Object.freeze({ ids: [], byId: {} });
+
+function useSessionList(list) {
+  return react.useSyncExternalStore(
     (callback) => { try { return list?.subscribe?.(callback) ?? (() => {}); } catch { return () => {}; } },
-    () => {
-      try {
-        const snapshot = list?.getSnapshot?.();
-        const array = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
-        return JSON.stringify(array.slice(0, 6));
-      } catch { return "[]"; }
-    },
-    () => "[]",
+    () => { try { return list?.getSnapshot?.() ?? EMPTY_SESSION_LIST; } catch { return EMPTY_SESSION_LIST; } },
+    () => EMPTY_SESSION_LIST,
   );
-  return react.useMemo(() => { try { return JSON.parse(ids); } catch { return []; } }, [ids]);
 }
+

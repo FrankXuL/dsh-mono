@@ -1,12 +1,25 @@
 // ---- split tree -> flex boxes ----------------------------------------------
 /**
  * Renders the layout tree from layout/tree.js. A split is a flex container in
- * its own direction; each child gets flex-grow = its share of `sizes`. Leaf
+ * its own direction; each child gets flex-grow = its share of \`sizes\`. Leaf
  * cells render one Pane each, separated by a visible (not yet draggable) sash.
  */
 function PaneTree(props) {
   return h("div", { className: "mono-tree" },
     h(PaneNode, { ...props, node: props.tree }));
+}
+
+/** A pane whose last tab was closed: the pane stays, the session does not. */
+function PaneEmpty(props) {
+  return h("div", { className: "mono-pane-empty", "data-mono-empty": props.paneId },
+    h("div", { className: "mono-pane-empty-title" }, "从这里开始"),
+    h("button", {
+      type: "button",
+      className: "mono-pane-empty-btn",
+      title: "Open session",
+      "aria-label": "Open session",
+      onClick: () => props.onOpenSession(props.paneId),
+    }, "打开会话"));
 }
 
 function PaneNode(props) {
@@ -16,6 +29,9 @@ function PaneNode(props) {
   if (node.type === "leaf") {
     const paneId = node.paneId;
     const active = props.activePaneId === paneId;
+    // panes can still hold the T03 shape; paneOf upgrades it on read.
+    const pane = paneOf(props.panes, paneId);
+    const tab = pane.tabs[pane.activeIndex];
     return h("div", {
       className: active ? "mono-pane mono-pane-active" : "mono-pane",
       "data-mono-pane": paneId,
@@ -23,13 +39,27 @@ function PaneNode(props) {
         if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
       },
     },
-      h(Pane, {
-        sessionId: props.panes?.[paneId] ?? null,
-        sessions: props.sessions,
-        renderSlot: props.renderSlot,
-        renderFactorySlot: props.renderFactorySlot,
-        SessionProvider: props.SessionProvider,
-      }));
+      h(TabStrip, {
+        paneId,
+        pane,
+        byId: props.byId,
+        onActivateTab: props.onActivateTab,
+        onCloseTab: props.onCloseTab,
+        onPromoteTab: props.onPromoteTab,
+        onOpenSession: props.onOpenSession,
+      }),
+      tab === undefined
+        ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
+        : h(Pane, {
+          // key: switching tabs must remount the native conversation, otherwise
+          // the SessionProvider keeps the old session's scope.
+          key: tab.sessionId,
+          sessionId: tab.sessionId,
+          sessions: props.sessions,
+          renderSlot: props.renderSlot,
+          renderFactorySlot: props.renderFactorySlot,
+          SessionProvider: props.SessionProvider,
+        }));
   }
 
   const count = node.children.length;

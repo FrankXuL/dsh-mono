@@ -13,8 +13,12 @@ const MODULES = [
   // Pure layout functions first: PaneTree renders their output, and a const
   // used before its definition is a TDZ error, not a hoisted reference.
   "src/client/layout/tree.js",
+  // Tabs and layout live outside React: the host unmounts the panel whenever it
+  // reveals a session itself, and the tabs have to survive that.
+  "src/client/state/workspace.js",
   "src/client/session/reference.js",
   "src/client/panes/Pane.js",
+  "src/client/panes/TabStrip.js",
   "src/client/panes/PaneTree.js",
   "src/client/persist/index.js",
 ];
