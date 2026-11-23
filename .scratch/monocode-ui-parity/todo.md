@@ -220,7 +220,49 @@ git push
 
 验证（一次性 profile `/tmp/t04home` + 无头 Chrome CDP，桌面 profile 未动）：连点 5 个侧栏会话，每次读到的都是 2 个标签（1 常驻 + 1 preview）、`previews:1`，preview 标签 `class="mono-tab mono-tab-active mono-tab-preview"` / `data-mono-preview="true"` / `font-style:italic`，标题依次被替换（ksfloan → kspay-ui → [#00] 前端 → kspay-orbit → [#00] 双通道）；双击 preview → `data-mono-preview="false"`、去掉 `mono-tab-preview`、`font-style:normal`；在 preview 标签的输入框发消息（本轮因额度用尽失败，但消息已落盘）→ 同样转正；逐个关掉两个标签 → `panes:1`、空标签条 + `[data-mono-empty]` 文案「从这里开始 / 打开会话」；「Split right」→ `panes:2`、两条标签条、新栏 `tabs:[]` + 空态，不继承邻居标签。控制台 0 条 `[mono]` 输出、0 个未捕获异常。
 
-**已知限制**：① 侧栏点开会切走宿主主栏（`layout.selectPanel(null)` 会卸载 MonoRoot），所以侧栏入口只能"镜像"出 preview 标签，不劫持宿主——Mono 不调用 `selectPanel('mono')` 把用户拽回来（plan.md 决策 1：补充件，宿主 UI 一行不动）；也因此"在 preview 标签里发消息"通常发生在宿主的 Conversation 里，转正靠会话列表的 `updatedAt`（`manager.handleSessionActivity` 落盘时间戳），而不是栏内 React 状态。② 首次扫到的 `updatedAt` 可能是本地索引的旧值，baseline 用 `max(updatedAt, Date.now())` 锚定打开时刻，否则一次陈旧重投影会被误判成"发了消息"。③ 会话没有选模型时，发送按钮可点但静默不发（无 `updatedAt` 变化），因此那种会话里的发送不会转正——这是宿主行为，不是标签逻辑。④ 无标签时会话仍被页面级 retain 持有（`heldRef` 只增不减，同 T03 已知权衡）。
+**已知限制**：① **侧栏点开会切走宿主主栏**（`layout.selectPanel(null)` 会卸载 MonoRoot）——审查实测：开 Mono(1 栏) → 点侧栏会话 → `mono:false`、栏数 0 → 点回 Mono 才看到新的 preview 标签。状态确实保住了（页面级 store 生效），但**视图被打断**：插件的核心用法就是「把侧栏会话拉进我并排的栏」，每拉一次就被踢出去再手点回来。这不是可接受的限制，是本单元的主交互缺口，由 **T04b** 补。也因此"在 preview 标签里发消息"通常发生在宿主的 Conversation 里，转正靠会话列表的 `updatedAt`（`manager.handleSessionActivity` 落盘时间戳），而不是栏内 React 状态。② 首次扫到的 `updatedAt` 可能是本地索引的旧值，baseline 用 `max(updatedAt, Date.now())` 锚定打开时刻，否则一次陈旧重投影会被误判成"发了消息"。③ 会话没有选模型时，发送按钮可点但静默不发（无 `updatedAt` 变化），因此那种会话里的发送不会转正——这是宿主行为，不是标签逻辑。④ 无标签时会话仍被页面级 retain 持有（`heldRef` 只增不减，同 T03 已知权衡）。
+
+---
+
+### [ ] T04b — 会话入口：栏内选择器 + 弹回
+
+**为什么单独一个单元**：T04 的 6 条验收都过了，但它没料到「宿主打开会话会卸载 Mono」这件事，于是"把侧栏会话拉进栏里"这个主交互实际不可用。这是 T04 交付缺口，不是新功能，所以挂在它后面而不是改历史结论。
+
+**目标**：往栏里加会话不再被踢出多栏视图；同时保留一条明确的路回宿主视图。
+
+**要做**
+
+1. **栏内会话选择器（D）**：点 `+` 弹出 popover，分两段——「新建会话」+「最近会话」列表（标题取 `title → displayTitle → id 前 8 位`，已在栏里的打勾或置灰）。选一个 → 开进**当前栏**；显式选择不是 preview，直接常驻。点外部/Esc 关闭，键盘可走。
+2. **弹回（B）**：页面级（不是 React 内）维护 `monoIntent`：进入 Mono 面板时置 true。`watchSessions` 的 `scan()` 里，宿主打开新会话 → 开成 preview 标签（已有）→ 若 `monoIntent` 且当前面板不是 `mono`，调 `ctx.layout.selectPanel('mono')` 弹回。**判据是意图，不是时序**——不要用「最近 1 秒离开过 Mono」这类窗口，宿主 selectPanel 与会话列表刷新的先后不可靠。
+3. **出口（必须同批交付）**：工具栏加「回到宿主视图」按钮 → `monoIntent = false` + `ctx.layout.selectPanel(null)`。没有它就不许开弹回——点侧栏会话是当时唯一的退路，弹回会把它堵死。
+4. **注入**：`inject` 加 `layout`；`ctx.layout.panelInfo` 是 `HostObservable<{activePanelId}>`（`getSnapshot`/`subscribe`），在 `apply()` 里订阅，这样 MonoRoot 被卸载后照样能收事件。订阅要放进 `ctx.effect` 以便卸载时释放。
+
+**过关**
+
+- 在 Mono 里点侧栏会话 → **不离开 Mono**，该会话以 preview 标签出现在当前栏
+- 在**宿主原生视图**里点侧栏会话 → **留在原生视图**，不被拽进 Mono
+- 点「回到宿主视图」→ 回到宿主 Conversation；之后再点侧栏会话仍留在原生视图
+- 点 `+` → 出选择器；选「最近会话」里的一个 → 进当前栏且**不是** preview；选「新建会话」→ 建新会话进当前栏
+- 选择器里已在本栏的会话有可见标记；开过的会话不重复出现两条标签
+- 连点 5 个侧栏会话，标签条仍只占 1 个 preview 位（T04 行为不回归）
+- 控制台零异常；`npm run build` + `node --check client.js` 过；store 自检 `node src/client/state/workspace.js` 过
+
+**Prompt**
+```
+读 .scratch/monocode-ui-parity/todo.md 的 T04 与 T04b，以及 plan.md「三、与宿主共存的策略」里的「『只加不改』的边界」表。前置：T04 已完成（标签条 + preview 态可用），但点侧栏会话会把 Mono 卸载，主交互不可用。
+
+你现在的任务：两件事一起做，缺一不可。
+1. 栏内会话选择器：点 + 弹 popover，「新建会话」+「最近会话」两段，选中的会话进当前栏且是常驻标签（不是 preview）。
+2. 弹回：页面级维护 monoIntent（进 Mono 置 true），宿主打开新会话时若 monoIntent 为真且当前面板不是 mono，调 ctx.layout.selectPanel('mono') 弹回，并让该会话以 preview 标签进当前栏。
+   判据用意图，不要用时序窗口（selectPanel 与会话列表刷新先后不可靠）。
+
+硬约束：弹回必须和「回到宿主视图」按钮在同一批交付。那个按钮清 monoIntent + selectPanel(null)。没有它，用户进了 Mono 就再也回不到宿主原生视图（点侧栏会话是当时唯一退路）。
+ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅，别放进组件（面板会被卸载）。
+
+验证用一次性 profile + 无头 Chrome CDP，不要碰 desktop profile。至少跑通这四条：Mono 内点侧栏→不离开 Mono；原生视图内点侧栏→不被拽走；点出口→回原生且之后不再被拽；点 + →出选择器且能选已有会话入栏。
+
+完成后：报告 monoIntent 的状态机（谁置 true、谁置 false）、选择器如何取会话标题、以及弹回在 panelInfo 上的订阅与释放方式。
+```
 
 ---
 
