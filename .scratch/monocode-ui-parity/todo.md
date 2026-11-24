@@ -346,7 +346,7 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 ---
 
-### [ ] T05 — 拖拽分栏
+### [x] T05 — 拖拽分栏
 
 **目标**：拖标签到栏边缘分出新栏，拖回来合回去。
 
@@ -382,6 +382,26 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 完成后：报告命中判定的实现、落点提示的渲染方式、以及你如何避免拖拽误触发点击。
 ```
+
+**完成** 2026-11-24
+
+产物：
+- `src/client/panes/Drag.js`（新）：`dropEdge(nx, ny)`（|nx-0.5| ≥ |ny-0.5| 走左右）、`dropTargetAt(x, y, fromPaneId)`（`document.elementFromPoint` → `closest("[data-mono-pane]")`，只认自己的属性；命中标的标签条 → `edge:null` 表示合并）、`showHint/hideHint`（两个 `position:fixed`、`pointer-events:none` 的覆盖层，wash 只盖目标半屏、线 2px 落在中线）、`beginTabDrag/dragMove/endDrag`（5px 阈值后才算拖拽、`body.mono-dragging` 禁选、Esc/pointercancel/window blur 取消）、点击兜底 `guardClick/swallowClick`。
+- `src/client/state/workspace.js`：`workspaceMoveTab(fromPaneId, sessionId, toPaneId, edge, newPaneId)` 三种结果——合并（edge null，`openTabInPane` + 空源栏 `removePane`）、整栏迁移（源栏只剩这一个标签 → 走 T02 的 `movePane`，同一栏组内是保尺寸的 `reorderInGroup`）、单标签外拖（源栏还有别的标签 → `splitPane` 在目标边新建一栏，只装这一个标签）。
+- `src/client/panes/TabStrip.js`：标签加 `onPointerDown` 起手（`onMouseDown` 激活原样保留，`.mono-tab-close` 上的按下被排除）。
+- `src/client/style.css`：`body.mono-dragging`、`.mono-drop-wash`、`.mono-drop-line`。
+- `scripts/build.mjs`：MODULES 插入 `src/client/panes/Drag.js`（在 `TabStrip.js` 之前）。
+- `client.js`：12 chunks / 97103 bytes；`node --check client.js`、`node src/client/layout/tree.js`（17 checks）、`node src/client/state/workspace.js` 全绿。
+
+验证：CDP 同 T04c 被沙箱封死，改由 `.scratch/monocode-ui-parity/tools/mono-probe.mjs` 驱动真机 `client.js`，T05 25/25 PASS（探针合计 39/39）：
+- 判向：0.1/0.5→left，0.9/0.45→right，0.5/0.1→top，0.4/0.95→bottom，等距 0.6/0.6→right。
+- 命中：右半/左半/上半各自 edge、标签条上 → edge null、自己的栏 → null、栏外/没有 closest 的元素 → null 且不抛。
+- 提示：右半 wash `left:500px width:500px height:600px`、线 `left:499px width:2px h 600px`；下半 wash `top:300px height:300px`、线 `top:299px h:2px`；合并时整栏 wash、线 `display:none`；`hideHint` 后两者都 `display:none`。
+- 移动：A(s2,s1)|B(s3) 前置；整栏 B 拖到 A 左半边 → 同一行内重排为 B|A、两栏标签不变；从 A 拖 s1 到 B 右半边 → 新建 pane-C 只装 s1，A 剩 s2；再从 C 拖回 A 的标签条 → 合并进 A 末尾、C 的叶子被移除、活动栏=A；同栏/未知栏/非法 edge 全为 no-op。
+
+避免误触发点击：`pointerdown` 只「上膛」，位移不足 5px 时 `endDrag` 直接返回、不碰任何状态，所以普通点击（激活标签、双击转正、中键关闭）一条不落；一旦真的开始拖，`pointerup` 后那个 `click` 由 window 捕获阶段 400ms 的守卫 `preventDefault + stopPropagation` 吃掉，不会落到落点下面的栏/标签/选择器上。拖拽也不读宿主的 `data-dockkit-*` / `data-sidebar-right-*`（feasibility-matrix #30）。
+
+**已知限制**：① 拖到自己这一栏的边上不放（同栏拖 = no-op），所以单栏布局没法用拖拽从自己身上分出新栏，仍走工具栏的 Split；这样避免误触把唯一一栏拆散。② 点击守卫窗口 400ms，拖完立刻点同一个位置的第一下会被吞。③ 指针事件的真实 DOM 行为（`elementFromPoint` 在真页面上的遮挡、覆盖层的 `pointer-events`）在无头环境里没有跑到，需按 T04c 的复验方式在真实宿主里点一次：拖标签到另一栏右半边应新建栏，拖回标签条应合并，拖起后按 Esc 应无变化。
 
 ---
 

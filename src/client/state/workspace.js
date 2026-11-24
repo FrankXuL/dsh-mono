@@ -189,6 +189,59 @@ function workspaceSplit(paneId, newPaneId) {
   }));
 }
 
+// ---- drag-drop: move one tab from one pane to another -----------------------
+/**
+ * A tab was dropped on another pane. `edge` is left/right/top/bottom for a
+ * split, null for "onto the target's tab strip" (merge there, no new pane).
+ *
+ * Three cases, smallest diff wins:
+ *  * merge (edge null): open in the target, drop the source leaf if it emptied.
+ *  * whole pane onto an edge: tree.js movePane owns reorder-vs-reparent, and a
+ *    same-axis reorder keeps every share.
+ *  * one tab out of a pane that keeps others: split a fresh cell beside the
+ *    target and put just that tab in it — the source keeps its tabs and its
+ *    size.
+ */
+function workspaceMoveTab(fromPaneId, sessionId, toPaneId, edge, newPaneId) {
+  if (typeof sessionId !== "string" || sessionId === "" || typeof newPaneId !== "string" || newPaneId === "") return;
+  if (typeof fromPaneId !== "string" || typeof toPaneId !== "string" || fromPaneId === toPaneId) return;
+  if (edge !== null && EDGE_AXIS[edge] === undefined) return;
+
+  workspaceUpdate((previous) => {
+    if (!containsPane(previous.tree, fromPaneId) || !containsPane(previous.tree, toPaneId)) return previous;
+    const source = paneOf(previous.panes, fromPaneId);
+    const index = source.tabs.findIndex((tab) => tab.sessionId === sessionId);
+    if (index < 0) return previous;
+    const panes = { ...previous.panes };
+    let tree = previous.tree;
+
+    if (edge === null) {
+      const target = paneOf(previous.panes, toPaneId);
+      panes[toPaneId] = openTabInPane(target, sessionId, false) ?? target;
+      const rest = closeTabAt(source, index);
+      if (rest.tabs.length === 0) {
+        tree = removePane(tree, fromPaneId);
+        if (tree === null) return previous;
+        delete panes[fromPaneId];
+      } else {
+        panes[fromPaneId] = rest;
+      }
+      return { ...previous, tree, panes, active: toPaneId };
+    }
+
+    // A pane carrying all its tabs moves as a leaf: reordering it inside the
+    // same group must keep the existing sizes (tree.js does exactly that).
+    if (source.tabs.length === 1) {
+      return { ...previous, tree: movePane(tree, fromPaneId, toPaneId, edge), active: fromPaneId };
+    }
+
+    tree = splitPane(tree, toPaneId, EDGE_AXIS[edge], newPaneId, EDGE_BEFORE[edge]);
+    panes[newPaneId] = { tabs: [{ sessionId, preview: false }], activeIndex: 0 };
+    panes[fromPaneId] = closeTabAt(source, index);
+    return { ...previous, tree, panes, active: newPaneId };
+  });
+}
+
 // ---- self-check: node src/client/state/workspace.js -------------------------
 function workspaceSelfCheck(assert) {
   const tab = (sessionId, preview) => ({ sessionId, preview });

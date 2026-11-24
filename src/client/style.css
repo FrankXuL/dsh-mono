@@ -181,6 +181,35 @@
   font-style: italic;
 }
 
+/* While a tab is in flight: no text selection, and the whole window shows the
+   grab cursor even when the pointer is over another pane's content. */
+body.mono-dragging {
+  user-select: none;
+  cursor: grabbing;
+}
+
+body.mono-dragging .mono-tab {
+  cursor: grabbing;
+}
+
+/* Drop hint: fixed overlays (never part of the flex layout), one wash for the
+   half the new pane will occupy, one 2px accent line on the split itself. */
+.mono-drop-wash {
+  position: fixed;
+  z-index: 70;
+  pointer-events: none;
+  background: var(--dsh-accent-wash, rgba(106, 141, 255, 0.14));
+  border-radius: 4px;
+}
+
+.mono-drop-line {
+  position: fixed;
+  z-index: 71;
+  pointer-events: none;
+  background: var(--dsh-accent, #6a8dff);
+  border-radius: 1px;
+}
+
 .mono-tab-close,
 .mono-tab-add {
   display: inline-flex;

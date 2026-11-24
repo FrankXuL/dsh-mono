@@ -19,6 +19,9 @@ const MODULES = [
   "src/client/session/reference.js",
   "src/client/panes/Pane.js",
   "src/client/panes/SessionPicker.js",
+  // The drag gesture owns the pointerdown TabStrip arms; it must be defined
+  // before the strip that calls it (a const used before its chunk runs is TDZ).
+  "src/client/panes/Drag.js",
   "src/client/panes/TabStrip.js",
   "src/client/panes/PaneTree.js",
   "src/client/persist/index.js",

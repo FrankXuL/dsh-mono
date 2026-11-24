@@ -42,6 +42,9 @@ function TabStrip(props) {
       title,
       "data-mono-tab": tab.sessionId,
       "data-mono-preview": tab.preview ? "true" : "false",
+      // Drag is a gesture on top of the tab: pointerdown arms it, mousedown
+      // still activates, and Drag.js decides past 5px whether it is a drag.
+      onPointerDown: (event) => beginTabDrag(event, paneId, tab.sessionId),
       onMouseDown: (event) => {
         if (event.button !== 0) return;
         props.onActivateTab(paneId, index);

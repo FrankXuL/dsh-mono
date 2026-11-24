@@ -824,6 +824,59 @@ window.__ModuleLoader__.load({
       }));
     }
 
+    // ---- drag-drop: move one tab from one pane to another -----------------------
+    /**
+     * A tab was dropped on another pane. `edge` is left/right/top/bottom for a
+     * split, null for "onto the target's tab strip" (merge there, no new pane).
+     *
+     * Three cases, smallest diff wins:
+     *  * merge (edge null): open in the target, drop the source leaf if it emptied.
+     *  * whole pane onto an edge: tree.js movePane owns reorder-vs-reparent, and a
+     *    same-axis reorder keeps every share.
+     *  * one tab out of a pane that keeps others: split a fresh cell beside the
+     *    target and put just that tab in it — the source keeps its tabs and its
+     *    size.
+     */
+    function workspaceMoveTab(fromPaneId, sessionId, toPaneId, edge, newPaneId) {
+      if (typeof sessionId !== "string" || sessionId === "" || typeof newPaneId !== "string" || newPaneId === "") return;
+      if (typeof fromPaneId !== "string" || typeof toPaneId !== "string" || fromPaneId === toPaneId) return;
+      if (edge !== null && EDGE_AXIS[edge] === undefined) return;
+
+      workspaceUpdate((previous) => {
+        if (!containsPane(previous.tree, fromPaneId) || !containsPane(previous.tree, toPaneId)) return previous;
+        const source = paneOf(previous.panes, fromPaneId);
+        const index = source.tabs.findIndex((tab) => tab.sessionId === sessionId);
+        if (index < 0) return previous;
+        const panes = { ...previous.panes };
+        let tree = previous.tree;
+
+        if (edge === null) {
+          const target = paneOf(previous.panes, toPaneId);
+          panes[toPaneId] = openTabInPane(target, sessionId, false) ?? target;
+          const rest = closeTabAt(source, index);
+          if (rest.tabs.length === 0) {
+            tree = removePane(tree, fromPaneId);
+            if (tree === null) return previous;
+            delete panes[fromPaneId];
+          } else {
+            panes[fromPaneId] = rest;
+          }
+          return { ...previous, tree, panes, active: toPaneId };
+        }
+
+        // A pane carrying all its tabs moves as a leaf: reordering it inside the
+        // same group must keep the existing sizes (tree.js does exactly that).
+        if (source.tabs.length === 1) {
+          return { ...previous, tree: movePane(tree, fromPaneId, toPaneId, edge), active: fromPaneId };
+        }
+
+        tree = splitPane(tree, toPaneId, EDGE_AXIS[edge], newPaneId, EDGE_BEFORE[edge]);
+        panes[newPaneId] = { tabs: [{ sessionId, preview: false }], activeIndex: 0 };
+        panes[fromPaneId] = closeTabAt(source, index);
+        return { ...previous, tree, panes, active: newPaneId };
+      });
+    }
+
     // ---- self-check: node src/client/state/workspace.js -------------------------
     function workspaceSelfCheck(assert) {
       const tab = (sessionId, preview) => ({ sessionId, preview });
@@ -1192,6 +1245,192 @@ window.__ModuleLoader__.load({
         items);
     }
 
+    // ---- tab drag: to a pane edge splits, to a tab strip merges -----------------
+    // Hit testing is geometry only: document.elementFromPoint(x, y), then the
+    // nearest element carrying OUR [data-mono-pane] attribute. The host's own
+    // dock attributes (data-dockkit-*, data-sidebar-right-*) are private to its
+    // dockkit implementation, carry no contract, and must never be read
+    // (feasibility-matrix.md #30) — so the drop target is always one of our panes.
+    //
+    // A drag only starts past DRAG_THRESHOLD px; below it the pointerdown belongs
+    // to the tab itself (activation, double click, middle click all keep working).
+    // Once a drag did start, the trailing click is swallowed for a moment so a
+    // drop never also triggers whatever ended up under the pointer.
+
+    const DRAG_THRESHOLD = 5;
+    const CLICK_GUARD_MS = 400;
+
+    /** Which half of a pane a normalized point is in. A tie resolves left/right. */
+    function dropEdge(nx, ny) {
+      if (Math.abs(nx - 0.5) >= Math.abs(ny - 0.5)) return nx < 0.5 ? "left" : "right";
+      return ny < 0.5 ? "top" : "bottom";
+    }
+
+    /**
+     * Drop target under the pointer, or null. Over the target's own tab strip the
+     * edge is null: that is "merge into this pane", not "split this pane".
+     */
+    function dropTargetAt(x, y, fromPaneId) {
+      const hit = document.elementFromPoint(x, y);
+      if (hit === null || typeof hit.closest !== "function") return null;
+      const paneEl = hit.closest("[data-mono-pane]");
+      if (paneEl === null) return null;
+      const paneId = paneEl.getAttribute("data-mono-pane");
+      if (typeof paneId !== "string" || paneId === "" || paneId === fromPaneId) return null;
+      const rect = paneEl.getBoundingClientRect();
+      if (!(rect.width > 0) || !(rect.height > 0)) return null;
+      const edge = hit.closest("[data-mono-tabs]") !== null
+        ? null
+        : dropEdge((x - rect.left) / rect.width, (y - rect.top) / rect.height);
+      return { paneId, edge, rect };
+    }
+
+    // ---- the drop hint (two fixed overlays, never in the layout) ---------------
+    let hintWash = null;
+    let hintLine = null;
+
+    function ensureHint() {
+      if (hintWash !== null) return;
+      hintWash = document.createElement("div");
+      hintWash.className = "mono-drop-wash";
+      hintLine = document.createElement("div");
+      hintLine.className = "mono-drop-line";
+      document.body.appendChild(hintWash);
+      document.body.appendChild(hintLine);
+    }
+
+    function hideHint() {
+      if (hintWash === null) return;
+      hintWash.style.display = "none";
+      hintLine.style.display = "none";
+    }
+
+    /** Half-pane wash + a 2px accent line on the edge the split will be made at. */
+    function showHint(target) {
+      ensureHint();
+      const rect = target.rect;
+      const vertical = target.edge === "left" || target.edge === "right";
+      let left = rect.left;
+      let top = rect.top;
+      let width = rect.width;
+      let height = rect.height;
+      if (target.edge === "left") width = rect.width / 2;
+      else if (target.edge === "right") { left = rect.left + rect.width / 2; width = rect.width / 2; }
+      else if (target.edge === "top") height = rect.height / 2;
+      else if (target.edge === "bottom") { top = rect.top + rect.height / 2; height = rect.height / 2; }
+      hintWash.style.display = "block";
+      hintWash.style.left = left + "px";
+      hintWash.style.top = top + "px";
+      hintWash.style.width = width + "px";
+      hintWash.style.height = height + "px";
+
+      if (target.edge === null) { hintLine.style.display = "none"; return; }
+      hintLine.style.display = "block";
+      if (vertical) {
+        hintLine.style.left = (rect.left + rect.width / 2 - 1) + "px";
+        hintLine.style.top = rect.top + "px";
+        hintLine.style.width = "2px";
+        hintLine.style.height = rect.height + "px";
+      } else {
+        hintLine.style.left = rect.left + "px";
+        hintLine.style.top = (rect.top + rect.height / 2 - 1) + "px";
+        hintLine.style.width = rect.width + "px";
+        hintLine.style.height = "2px";
+      }
+    }
+
+    // ---- the gesture -----------------------------------------------------------
+    let tabDrag = null;
+
+    function beginTabDrag(event, paneId, sessionId) {
+      if (tabDrag !== null || event.button !== 0) return;
+      // The close button lives inside the tab; grabbing it is a click, not a drag.
+      if (typeof event.target?.closest === "function" && event.target.closest(".mono-tab-close") !== null) return;
+      // Focus first: once the pointer leaves, the browser would otherwise move
+      // focus to the body and the drop target would not be reachable by keyboard.
+      try { event.currentTarget?.focus?.(); } catch (error) { log("tab focus failed", String(error)); }
+      tabDrag = { paneId, sessionId, startX: event.clientX, startY: event.clientY, active: false, target: null };
+      window.addEventListener("pointermove", dragMove, true);
+      window.addEventListener("pointerup", dragUp, true);
+      window.addEventListener("pointercancel", dragCancel, true);
+      window.addEventListener("keydown", dragKey, true);
+      window.addEventListener("blur", dragBlur, true);
+    }
+
+    function detachDragListeners() {
+      window.removeEventListener("pointermove", dragMove, true);
+      window.removeEventListener("pointerup", dragUp, true);
+      window.removeEventListener("pointercancel", dragCancel, true);
+      window.removeEventListener("keydown", dragKey, true);
+      window.removeEventListener("blur", dragBlur, true);
+    }
+
+    function dragMove(event) {
+      if (tabDrag === null) return;
+      const dx = event.clientX - tabDrag.startX;
+      const dy = event.clientY - tabDrag.startY;
+      if (!tabDrag.active) {
+        if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
+        tabDrag.active = true;
+        document.body.classList.add("mono-dragging");
+      }
+      event.preventDefault();
+      const target = dropTargetAt(event.clientX, event.clientY, tabDrag.paneId);
+      tabDrag.target = target;
+      if (target === null) hideHint();
+      else showHint(target);
+    }
+
+    function dragKey(event) {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      endDrag(true);
+    }
+
+    function dragUp() { endDrag(false); }
+    function dragCancel() { endDrag(true); }
+    function dragBlur() { endDrag(true); }
+
+    function endDrag(cancelled) {
+      if (tabDrag === null) return;
+      const drag = tabDrag;
+      tabDrag = null;
+      detachDragListeners();
+      document.body.classList.remove("mono-dragging");
+      hideHint();
+      if (!drag.active) return;             // a plain click: leave it entirely alone
+      guardClick();                          // swallow the click this drag produced
+      const target = cancelled ? null : drag.target;
+      if (target === null) return;
+      // A move is an explicit choice about that tab, so it stops being a preview.
+      workspacePromoteSession(drag.sessionId);
+      workspaceMoveTab(drag.paneId, drag.sessionId, target.paneId, target.edge, nextPaneId());
+    }
+
+    // ---- click guard -----------------------------------------------------------
+    // The pointerup that ends a drag still produces a click. It must not reach a
+    // pane (activation), a tab (double click), or the session picker underneath.
+    let clickGuardUntil = 0;
+    let clickGuardOn = false;
+
+    function guardClick() {
+      clickGuardUntil = Date.now() + CLICK_GUARD_MS;
+      if (clickGuardOn) return;
+      clickGuardOn = true;
+      window.addEventListener("click", swallowClick, true);
+    }
+
+    function swallowClick(event) {
+      if (Date.now() >= clickGuardUntil) {
+        clickGuardOn = false;
+        window.removeEventListener("click", swallowClick, true);
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    }
+
     // ---- tab strip: one tab per session in a pane -------------------------------
     // A tab's label is the host's own displayTitle (durable title, else workspace
     // basename, else id). The tab strip exists because the native session header is
@@ -1236,6 +1475,9 @@ window.__ModuleLoader__.load({
           title,
           "data-mono-tab": tab.sessionId,
           "data-mono-preview": tab.preview ? "true" : "false",
+          // Drag is a gesture on top of the tab: pointerdown arms it, mousedown
+          // still activates, and Drag.js decides past 5px whether it is a drag.
+          onPointerDown: (event) => beginTabDrag(event, paneId, tab.sessionId),
           onMouseDown: (event) => {
             if (event.button !== 0) return;
             props.onActivateTab(paneId, index);
@@ -1394,7 +1636,7 @@ window.__ModuleLoader__.load({
     const PERSIST_KEY = "dsh-mono:workspace:v1";
 
     /** CSS text, inlined from src/client/style.css. */
-    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
+    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n/* While a tab is in flight: no text selection, and the whole window shows the\n   grab cursor even when the pointer is over another pane's content. */\nbody.mono-dragging {\n  user-select: none;\n  cursor: grabbing;\n}\n\nbody.mono-dragging .mono-tab {\n  cursor: grabbing;\n}\n\n/* Drop hint: fixed overlays (never part of the flex layout), one wash for the\n   half the new pane will occupy, one 2px accent line on the split itself. */\n.mono-drop-wash {\n  position: fixed;\n  z-index: 70;\n  pointer-events: none;\n  background: var(--dsh-accent-wash, rgba(106, 141, 255, 0.14));\n  border-radius: 4px;\n}\n\n.mono-drop-line {\n  position: fixed;\n  z-index: 71;\n  pointer-events: none;\n  background: var(--dsh-accent, #6a8dff);\n  border-radius: 1px;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
 
     // ---- plugin root -----------------------------------------------------------
     /** Services resolve lazily: cordis may materialise them after apply() ran. */
