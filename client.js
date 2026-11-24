@@ -1052,10 +1052,83 @@ window.__ModuleLoader__.load({
     // ponytail: anchored inside the tab strip, no portal and no collision flip. A
     // pane shorter than the list clips the popover at its bottom; add measurement
     // only if that ever bites.
+
+    /** The session the host's own sidebar treats as current (retainedBy.mainView). */
+    function mainSessionId(byId) {
+      if (byId === undefined || byId === null) return undefined;
+      return Object.keys(byId).find((id) => Number(byId[id]?.retainedBy?.mainView ?? 0) > 0);
+    }
+
+    /**
+     * Which sessions the host sidebar would show for the pane's workspace, replayed
+     * here (ui-workspace/src/client/tree.ts sessionVisible, rows/WorkspaceBrowser.tsx):
+     *
+     *  - a blank Session is the provisional "New Session" row of its workspace, and
+     *    only the host's current one is ever shown;
+     *  - archived Sessions are hidden;
+     *  - membership is WorkspaceView.sessionIds — the session row carries no
+     *    workspace field, so it has to come from the workspaces service. That
+     *    service is not in this plugin's inject list (it stays optional): without
+     *    it, or without a workspace to anchor on, nothing is filtered by workspace
+     *    and each row labels its cwd instead. Degraded mode is recorded in Todo T04c.
+     *
+     * ponytail: the workspace list is read once per render, not subscribed — the
+     * picker lives for a moment, and a stale list only misgroups a row until the
+     * next open.
+     */
+    function pickerScope(pane, byId) {
+      let snapshot;
+      try {
+        const list = service("workspaces")?.list;
+        if (list === undefined || typeof list.getSnapshot !== "function") return null;
+        snapshot = list.getSnapshot();
+      } catch (error) {
+        log("workspaces snapshot failed", String(error));
+        return null;
+      }
+      const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+      const tab = pane?.tabs?.[pane?.activeIndex ?? 0];
+      // The workspace the user is looking at: the pane's own session first, else
+      // the host's current one.
+      for (const sessionId of [tab?.sessionId, mainSessionId(byId)]) {
+        if (typeof sessionId !== "string") continue;
+        const item = items.find((workspace) => (
+          Array.isArray(workspace?.sessionIds) && workspace.sessionIds.includes(sessionId)
+        ));
+        if (item !== undefined) {
+          return {
+            members: new Set(item.sessionIds),
+            archived: new Set(Array.isArray(snapshot.archivedSessionIds) ? snapshot.archivedSessionIds : []),
+          };
+        }
+      }
+      return null;
+    }
+
+    /** Last path segment of a cwd: how the sidebar tells same-titled sessions apart. */
+    function cwdLabel(cwd) {
+      if (typeof cwd !== "string" || cwd === "") return "";
+      const clean = cwd.replace(/[\\/]+$/, "");
+      const at = Math.max(clean.lastIndexOf("/"), clean.lastIndexOf("\\"));
+      return at < 0 ? clean : clean.slice(at + 1);
+    }
+
+    function pickerIds(all, byId, scope) {
+      const ids = Array.isArray(all) ? all : [];
+      const main = mainSessionId(byId);
+      return ids.filter((sessionId) => {
+        const row = byId?.[sessionId];
+        if (row === undefined) return false;
+        if (row.blank === true && sessionId !== main) return false;
+        if (scope === null) return true;
+        return scope.members.has(sessionId) && !scope.archived.has(sessionId);
+      });
+    }
+
     function SessionPicker(props) {
       const { paneId, pane, byId } = props;
       const held = new Set(pane.tabs.map((tab) => tab.sessionId));
-      const ids = Array.isArray(props.ids) ? props.ids.slice(0, 12) : [];
+      const ids = pickerIds(props.ids, byId, pickerScope(pane, byId)).slice(0, 12);
 
       // One capture-phase pair for the whole popover: mousedown outside closes,
       // Escape closes. The "+" that owns this picker is ignored so its own click
@@ -1087,16 +1160,19 @@ window.__ModuleLoader__.load({
         : ids.map((sessionId) => {
           const title = tabTitle(byId, sessionId);
           const inPane = held.has(sessionId);
+          const cwd = byId?.[sessionId]?.cwd;
+          const dir = cwdLabel(cwd);
           return h("button", {
             key: sessionId,
             type: "button",
             className: "mono-picker-item" + (inPane ? " mono-picker-item-held" : ""),
-            title,
+            title: dir === "" ? title : title + " — " + cwd,
             "data-mono-picker-item": sessionId,
             "data-mono-picker-held": inPane ? "true" : "false",
             onClick: () => props.onPick(sessionId),
           },
             h("span", { className: "mono-picker-title" }, title),
+            dir === "" ? null : h("span", { className: "mono-picker-dir" }, dir),
             inPane ? h("span", { className: "mono-picker-check", "aria-hidden": true }, "\u2713") : null);
         });
 
@@ -1318,7 +1394,7 @@ window.__ModuleLoader__.load({
     const PERSIST_KEY = "dsh-mono:workspace:v1";
 
     /** CSS text, inlined from src/client/style.css. */
-    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
+    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
 
     // ---- plugin root -----------------------------------------------------------
     /** Services resolve lazily: cordis may materialise them after apply() ran. */
@@ -1475,10 +1551,14 @@ window.__ModuleLoader__.load({
             monoIntent = true;
             return;
           }
-          // null is the Conversation: either the host opened a session or the user
-          // left through it. Any other id is another global panel the user picked
-          // on purpose — clicking 插件 must not yank them back into Mono.
-          if (activePanel() !== null || !monoIntent) return;
+          // Any id other than null is another global panel the user picked on
+          // purpose (插件, settings…): drop the intent, they are not coming back to
+          // Mono by accident. Clicking a session from inside that panel must leave
+          // them there, and watchSessions still parks the session in a Mono tab.
+          if (activePanel() !== null) { monoIntent = false; return; }
+          // null is the Conversation: the host opened a session, or the user left
+          // through it — that is the case that reveals Mono again.
+          if (!monoIntent) return;
           // Settle on the next task: the host's reveal transaction finishes first,
           // so the session id below is the one it actually selected.
           setTimeout(() => {
@@ -1632,7 +1712,14 @@ window.__ModuleLoader__.load({
         h(PaneTree, {
           tree: layout.tree,
           ids: listState?.ids,
-          onPickSession: (paneId, sessionId) => workspaceOpenTab(paneId, sessionId, {}),
+          // A pick is an explicit choice, so it promotes. openTabInPane returns
+          // early for a tab already in this pane (switching tabs must not promote a
+          // preview — that early return is load-bearing elsewhere), so promotion is
+          // its own step, before the open.
+          onPickSession: (paneId, sessionId) => {
+            workspacePromoteSession(sessionId);
+            workspaceOpenTab(paneId, sessionId, {});
+          },
           panes: layout.panes,
           byId: listState?.byId,
           activePaneId: layout.active,

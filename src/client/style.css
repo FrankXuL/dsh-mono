@@ -310,6 +310,14 @@
   white-space: nowrap;
 }
 
+/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the
+   host's own sidebar tells them apart. */
+.mono-picker-dir {
+  flex: none;
+  font-size: 11px;
+  opacity: 0.5;
+}
+
 /* Already in this pane: marked, still clickable (opening it only focuses it). */
 .mono-picker-item-held {
   opacity: 0.7;

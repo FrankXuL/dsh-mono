@@ -153,10 +153,14 @@ function watchPanelIntent() {
         monoIntent = true;
         return;
       }
-      // null is the Conversation: either the host opened a session or the user
-      // left through it. Any other id is another global panel the user picked
-      // on purpose — clicking 插件 must not yank them back into Mono.
-      if (activePanel() !== null || !monoIntent) return;
+      // Any id other than null is another global panel the user picked on
+      // purpose (插件, settings…): drop the intent, they are not coming back to
+      // Mono by accident. Clicking a session from inside that panel must leave
+      // them there, and watchSessions still parks the session in a Mono tab.
+      if (activePanel() !== null) { monoIntent = false; return; }
+      // null is the Conversation: the host opened a session, or the user left
+      // through it — that is the case that reveals Mono again.
+      if (!monoIntent) return;
       // Settle on the next task: the host's reveal transaction finishes first,
       // so the session id below is the one it actually selected.
       setTimeout(() => {
@@ -310,7 +314,14 @@ function MonoRoot(props) {
     h(PaneTree, {
       tree: layout.tree,
       ids: listState?.ids,
-      onPickSession: (paneId, sessionId) => workspaceOpenTab(paneId, sessionId, {}),
+      // A pick is an explicit choice, so it promotes. openTabInPane returns
+      // early for a tab already in this pane (switching tabs must not promote a
+      // preview — that early return is load-bearing elsewhere), so promotion is
+      // its own step, before the open.
+      onPickSession: (paneId, sessionId) => {
+        workspacePromoteSession(sessionId);
+        workspaceOpenTab(paneId, sessionId, {});
+      },
       panes: layout.panes,
       byId: listState?.byId,
       activePaneId: layout.active,

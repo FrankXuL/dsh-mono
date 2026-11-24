@@ -296,7 +296,7 @@ ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅�
 
 审查用的一次性 profile `/tmp/t04bhome` 与 CDP 脚本（`/tmp/revlib.mjs` 等）都在 `/tmp`，未碰 desktop profile。
 
-### [ ] T04c — 修 T04b 三条缺陷（约半天）
+### [x] T04c — 修 T04b 三条缺陷（约半天）
 
 **目标**：把独立审查开出的三条缺陷修掉。三条都有确定的复现路径，不需要再调研。
 
@@ -316,6 +316,33 @@ ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅�
 - `npm run build` + `node --check client.js` + `node src/client/state/workspace.js` 全绿，控制台零异常
 
 **Prompt**：见 T05 的 Prompt（T04c 与 T05 同批下发，分两次提交）。
+
+**完成** 2026-11-24
+
+产物：
+- `src/client/index.js:159-166`（缺陷 1）：`if (activePanel() !== null) { monoIntent = false; return; }` 换成原来的一行判断；`null`=Conversation 时才保留意图继续往下走。
+- `src/client/index.js:314-325`（缺陷 2）：`onPickSession` 改成先 `workspacePromoteSession(sessionId)` 再 `workspaceOpenTab(paneId, sessionId, {})`。`openTabInPane` 对已存在标签的提前 return（`src/client/state/workspace.js:53`）一行未动。
+- `src/client/panes/SessionPicker.js`（缺陷 3）：新增 `mainSessionId(byId)`（`retainedBy.mainView > 0`）、`pickerScope(pane, byId)`（锚点 = 本栏当前标签 → 宿主主会话，用 `workspaces.list.getSnapshot()` 的 `items[].sessionIds` 找归属，返回 `{members, archived}`；拿不到就返回 `null`）、`pickerIds(all, byId, scope)`（`blank` 只留应用主会话；有 scope 时只要 members 且不在 archived）、`cwdLabel(cwd)`；每行加 cwd 基名后缀。
+- `src/client/style.css`：`.mono-picker-dir`。
+- `.scratch/monocode-ui-parity/tools/mono-probe.mjs`：宿主规则探针（读根目录 `client.js`，注入 fake `window/document/react/ctx` 后直接跑插件工厂）。
+- `client.js`：`npm run build` 重建，11 chunks / 85469 bytes；`node --check client.js`、`node src/client/state/workspace.js`（ok workspace state checks）全绿。
+
+验证：CDP 实点在本会话的沙箱内跑不起来（`dsh plugin --profile mono-cdp add …` → `EPERM mkdir ~/.dsh/profiles/mono-cdp`；`~/Library/Application Support/DeepSeek Harness` 同样 EPERM；换 `DSH_HOME=/tmp/mono-dsh` 能建 profile、能 `--dump-config`，但 `dsh --profile cdp --no-open` 启动后日志 0 字节、端口不监听、`Debugger.pause` 无栈，lsof 见主线程卡在 Security.framework/LaunchServices，即宿主 Electron 在该沙箱内起不来）。改用探针跑真机代码取证，14/14 PASS：
+
+1. 意图泄漏：插件面板（`activePanelId="plugins"`）里点会话 → `selectPanel` 未被调用、`panes` 无新标签；点「回 Mono」后再点会话 → `selectPanel("mono")` 被调用一次、宿主会话落成该栏 preview 标签；出口按钮 `[data-mono-exit]` 存在，点过之后意图清空，再点会话不弹。
+2. 选择器转正：`s1` 为 preview → `workspaceActivateTab` 切到别处后 preview 仍在（`openTabInPane` 语义未变）→ `onPickSession("pane-A","s1")` → `preview:false`，标签数不变。
+3. 选择器范围：wA（`sessionIds:["s1","s2","s4"]`）里 s3（wB）被剔除、s5（archived）被剔除、s4（blank 且非应用主会话）被剔除，只剩 s1/s2；每行 cwd 后缀 `kspay-ui / tmp / tmp-2 / tmp2`，同标题 `tmp` 可区分。
+
+**已知降级**：归档清单只存在于 `workspaces.list` 的 `archivedSessionIds`（`sessions.list` 行里没有该字段）。插件没有把 `@deepseek-ai/dsh-client-ui-workspace` 列进 `MONO_PLUGIN.inject`（只加不改），`workspaces` 服务按需现取；若该服务缺席，选择器退回全量列表（空白规则仍生效，因为只需行的 `blank`）——此时归档会话会出现，靠 cwd 后缀区分。
+
+**复验方式**（需在工作区外有写权限的环境）：
+
+```bash
+DSH_HOME=/tmp/mono-dsh dsh plugin --profile cdp add link:/Users/xulilili/code/github/dsh-mono
+DSH_HOME=/tmp/mono-dsh dsh --profile cdp --no-open
+```
+
+Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mono → 点侧栏会话：应弹回 Mono 且该会话是 preview 标签；选择器条数应与侧栏当前工作区一致。
 
 ---
 
