@@ -18,6 +18,7 @@ const MODULES = [
   "src/client/state/workspace.js",
   "src/client/session/reference.js",
   "src/client/panes/Pane.js",
+  "src/client/panes/SessionPicker.js",
   "src/client/panes/TabStrip.js",
   "src/client/panes/PaneTree.js",
   "src/client/persist/index.js",

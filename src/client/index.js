@@ -31,6 +31,15 @@ let paneSeq = 0;
 const nextPaneId = () => "pane-" + ++paneSeq;
 
 /**
+ * The user's intent to sit in Mono — page-level on purpose: MonoRoot unmounts
+ * every time the host reveals a panel of its own, and the bounce has to outlive
+ * it. Set true by entering Mono; cleared ONLY by the toolbar exit (T04b: the
+ * exit ships with the bounce, otherwise the bounce traps the user).
+ */
+let monoIntent = false;
+
+
+/**
  * The host's own session open is not ours to observe: uiWorkspace.openSession
  * reveals the Conversation main panel (layout.selectPanel(null)), which unmounts
  * this one. Its side effects stay visible, and they are what the tab strip
@@ -40,8 +49,10 @@ const nextPaneId = () => "pane-" + ++paneSeq;
  *    so a new mainView id means "the user just opened a session";
  *  - the prompt sent inside it moves that session's own snapshot, which Pane
  *    reports as a use (see watchPreviewUse below).
- * It never calls layout.selectPanel("mono") to yank the user back: Mono is an
- * addition to the host UI, not a replacement (plan.md decision 1).
+ * It does call layout.selectPanel("mono") after such an open — but only while
+ * the user's intent is Mono (monoIntent below). The toolbar exit clears that
+ * intent, and the two ship together: without the exit the bounce would trap
+ * the user inside Mono (T04b).
  */
 // Preview tabs promote when the session is actually used. A session opened from
 // the sidebar is prompted in the host's own Conversation panel (opening it
@@ -79,6 +90,98 @@ function watchPreviewUse(snapshot) {
   }
 }
 
+/**
+ * The session the host is showing: the one it retains for mainView. Read at
+ * bounce time, because the reveal does not always change the list (clicking the
+ * session that is already selected re-reveals it without a retention delta).
+ */
+function hostMainSession() {
+  const list = service("sessions")?.list;
+  if (list === undefined) return undefined;
+  try {
+    const snapshot = list.getSnapshot();
+    const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
+    return ids.find((id) => (snapshot.byId?.[id]?.retainedBy?.mainView ?? 0) > 0);
+  } catch { return undefined; }
+}
+
+/** Reveal Mono when the intent says Mono. No-op when already there. */
+function bounceToMono() {
+  const layout = service("layout");
+  if (layout === undefined || typeof layout.selectPanel !== "function") return;
+  try {
+    if (layout.panelInfo?.getSnapshot?.()?.activePanelId === PANEL_ID) return;
+    layout.selectPanel(PANEL_ID);
+  } catch (error) {
+    // selectPanel throws when the main key is not registered (host torn down).
+    log("bounce back failed", String(error));
+  }
+}
+
+/**
+ * monoIntent is page-level state, so the subscription lives in apply(), not in
+ * a component: the host unmounts MonoRoot whenever it reveals one of its own
+ * panels, and the intent must survive that. Two rules, no timer between them:
+ *  - looking at Mono sets the intent;
+ *  - the panel turning into the Conversation never clears it — that reveal is
+ *    the host open this feature answers. Only the toolbar exit clears it.
+ *
+ * Services are resolved lazily and retried like watchSessions: cordis may
+ * materialise a service slightly after apply(). The returned disposer is what
+ * ctx.effect releases on unload.
+ */
+function watchPanelIntent() {
+  let stopped = false;
+  let unlisten = null;
+  let attempts = 0;
+
+  const attach = () => {
+    if (stopped) return;
+    const source = service("layout")?.panelInfo;
+    if (source === undefined || typeof source.subscribe !== "function") {
+      if (attempts++ < 40) setTimeout(attach, 250);
+      return;
+    }
+    const activePanel = () => {
+      try { return source.getSnapshot()?.activePanelId ?? null; } catch { return null; }
+    };
+    // Opening Mono from the sidebar is the ordinary case; a page that starts on
+    // Mono (restored selection) is the same intent.
+    if (activePanel() === PANEL_ID) monoIntent = true;
+    const off = source.subscribe(() => {
+      if (activePanel() === PANEL_ID) {
+        monoIntent = true;
+        return;
+      }
+      // null is the Conversation: either the host opened a session or the user
+      // left through it. Any other id is another global panel the user picked
+      // on purpose — clicking 插件 must not yank them back into Mono.
+      if (activePanel() !== null || !monoIntent) return;
+      // Settle on the next task: the host's reveal transaction finishes first,
+      // so the session id below is the one it actually selected.
+      setTimeout(() => {
+        if (stopped || !monoIntent || activePanel() !== null) return;
+        const sessionId = hostMainSession();
+        if (sessionId !== undefined) workspaceOpenTab(workspaceActivePane(), sessionId, { preview: true });
+        bounceToMono();
+      }, 0);
+    });
+    unlisten = typeof off === "function" ? off
+      : off !== undefined && off !== null && typeof off.unsubscribe === "function"
+        ? () => off.unsubscribe()
+        : null;
+  };
+
+  attach();
+  return () => {
+    stopped = true;
+    if (unlisten !== null) {
+      try { unlisten(); } catch (error) { log("layout unsubscribe failed", String(error)); }
+      unlisten = null;
+    }
+  };
+}
+
 let watching = false;
 function watchSessions(sessions, attempts = 0) {
   if (watching) return;
@@ -89,6 +192,7 @@ function watchSessions(sessions, attempts = 0) {
   }
   watching = true;
   let host = null;
+  let primed = false;
   const scan = () => {
     let snapshot;
     try { snapshot = list.getSnapshot(); } catch { return; }
@@ -97,8 +201,19 @@ function watchSessions(sessions, attempts = 0) {
     // ponytail: first positive mainView in list order covers the instant the
     // host holds two (retain new, then release old); the next scan settles it.
     const opened = ids.find((id) => (byId[id]?.retainedBy?.mainView ?? 0) > 0);
+    // Only the first scan is the baseline: a session the host already had
+    // selected at boot is not a fresh open. The baseline is consumed even when
+    // nothing is retained (a page that boots on the home screen), otherwise the
+    // first session opened afterwards would be swallowed as the baseline and
+    // the bounce would never latch.
+    const booting = !primed;
+    primed = true;
     if (opened === undefined) return;
-    if (host !== null && opened !== host) {
+    if (!booting && opened !== host) {
+      // Mirror the host's open into this pane. The bounce back to Mono is not
+      // this branch's job: watchPanelIntent owns it, keyed on the panel turning
+      // into the Conversation, because that reveal also happens without a list
+      // change (re-clicking the session the host already shows).
       workspaceOpenTab(workspaceActivePane(), opened, { preview: true });
     }
     host = opened;
@@ -165,6 +280,16 @@ function MonoRoot(props) {
     );
   };
 
+  // The way back to the host's own view, and the only thing that clears the
+  // intent: leaving through the host (clicking a sidebar session) is answered
+  // by the bounce, so without this button Mono would be a one-way door.
+  const exitToHost = () => {
+    monoIntent = false;
+    const host = service("layout");
+    if (host === undefined || typeof host.selectPanel !== "function") { log("no layout service"); return; }
+    try { host.selectPanel(null); } catch (error) { log("exit to host failed", String(error)); }
+  };
+
   return h("div", { className: "mono-root" },
     h("div", { className: "mono-toolbar" },
       h("button", {
@@ -173,9 +298,19 @@ function MonoRoot(props) {
         title: "Split right",
         "aria-label": "Split right",
         onClick: () => workspaceSplit(layout.active, nextPaneId()),
-      }, "+")),
+      }, "+"),
+      h("button", {
+        type: "button",
+        className: "mono-tool-btn mono-tool-exit",
+        title: "回到宿主视图",
+        "aria-label": "回到宿主视图",
+        "data-mono-exit": "true",
+        onClick: exitToHost,
+      }, "回到宿主视图")),
     h(PaneTree, {
       tree: layout.tree,
+      ids: listState?.ids,
+      onPickSession: (paneId, sessionId) => workspaceOpenTab(paneId, sessionId, {}),
       panes: layout.panes,
       byId: listState?.byId,
       activePaneId: layout.active,
@@ -192,10 +327,16 @@ function MonoRoot(props) {
 }
 
 const MONO_PLUGIN = {
-  inject: ["slots"],
+  // layout is read for the occupancy and written only on the user's behalf:
+  // selectPanel("mono") is the bounce, selectPanel(null) is the exit they asked
+  // for by pressing the button.
+  inject: ["slots", "layout"],
   apply(ctx) {
     CTX = ctx;
     ensureStyle();
+    // Page-level, not panel-level: it has to keep receiving panel switches while
+    // MonoRoot is unmounted.
+    ctx.effect(watchPanelIntent);
     // The \`children\` declaration is load-bearing: it is what makes the host
     // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
     // the panes render the "no SessionProvider" fallback. Cost: with a dead

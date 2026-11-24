@@ -43,6 +43,8 @@ function PaneNode(props) {
         paneId,
         pane,
         byId: props.byId,
+        ids: props.ids,
+        onPickSession: props.onPickSession,
         onActivateTab: props.onActivateTab,
         onCloseTab: props.onCloseTab,
         onPromoteTab: props.onPromoteTab,

@@ -17,9 +17,16 @@ function tabTitle(byId, sessionId) {
  * data-mono-preview / .mono-tab-preview is the transient state: italic title,
  * replaced by the next session opened in this pane, promoted on double click,
  * Enter, or the first prompt sent inside it.
+ *
+ * The "+" opens the in-pane session picker (SessionPicker), not a bare create:
+ * a session opened from the host sidebar reveals the host's panel, and the
+ * picker is how the same thing is done without leaving Mono.
  */
 function TabStrip(props) {
   const { paneId, pane, byId } = props;
+  // Local to one strip: a pane is only remounted (split) with an empty strip,
+  // so there is no open picker to lose.
+  const [pickerOpen, setPickerOpen] = react.useState(false);
   const items = pane.tabs.map((tab, index) => {
     const title = tabTitle(byId, tab.sessionId);
     const active = index === pane.activeIndex;
@@ -62,11 +69,30 @@ function TabStrip(props) {
     key: "new-tab",
     type: "button",
     className: "mono-tab-add",
-    title: "New session",
-    "aria-label": "New session",
+    title: "Open session",
+    "aria-label": "Open session",
+    "aria-expanded": pickerOpen ? "true" : "false",
     "data-mono-tab-add": paneId,
     onMouseDown: (event) => event.stopPropagation(),
-    onClick: () => props.onOpenSession(paneId),
+    onClick: () => setPickerOpen((open) => !open),
   }, "+"));
-  return h("div", { className: "mono-tabs", role: "tablist", "data-mono-tabs": paneId }, items);
+
+  // The wrapper only exists to anchor the popover: .mono-tabs scrolls, and a
+  // scrolling box clips an absolutely positioned child.
+  return h("div", { className: "mono-tabstrip" },
+    h("div", { className: "mono-tabs", role: "tablist", "data-mono-tabs": paneId }, items),
+    pickerOpen
+      ? h(SessionPicker, {
+        paneId,
+        pane,
+        byId,
+        ids: props.ids,
+        onPick: (sessionId) => {
+          setPickerOpen(false);
+          if (typeof props.onPickSession === "function") props.onPickSession(paneId, sessionId);
+        },
+        onNew: () => { setPickerOpen(false); props.onOpenSession(paneId); },
+        onClose: () => setPickerOpen(false),
+      })
+      : null);
 }

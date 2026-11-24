@@ -224,7 +224,7 @@ git push
 
 ---
 
-### [ ] T04b — 会话入口：栏内选择器 + 弹回
+### [x] T04b — 会话入口：栏内选择器 + 弹回
 
 **为什么单独一个单元**：T04 的 6 条验收都过了，但它没料到「宿主打开会话会卸载 Mono」这件事，于是"把侧栏会话拉进栏里"这个主交互实际不可用。这是 T04 交付缺口，不是新功能，所以挂在它后面而不是改历史结论。
 
@@ -263,6 +263,27 @@ ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅�
 
 完成后：报告 monoIntent 的状态机（谁置 true、谁置 false）、选择器如何取会话标题、以及弹回在 panelInfo 上的订阅与释放方式。
 ```
+
+**完成** 2026-11-24
+
+产物：`src/client/panes/SessionPicker.js`（新，75 行：popover，`新建会话` + `最近会话` 最多 12 条，已在本栏的会话行打 ✓ 并置灰，点外部 / Esc 关闭）、`src/client/panes/TabStrip.js`（`+` 开合 picker；外层 `.mono-tabstrip` 包住 `.mono-tabs`——后者 `overflow` 滚动，绝对定位的子元素会被裁掉）、`src/client/panes/PaneTree.js`（透传 `ids` / `onPickSession`）、`src/client/index.js`（`monoIntent` / `watchPanelIntent()` / `hostMainSession()` / `bounceToMono()` / 工具栏「回到宿主视图」，`inject: ["slots","layout"]`，`apply()` 里 `ctx.effect(watchPanelIntent)`）、`src/client/style.css`（picker / wrapper / exit 按钮）、`scripts/build.mjs`（MODULES 加 `panes/SessionPicker.js`）、`client.js`（51154 → 81154 bytes，11 chunk）。
+
+**monoIntent 状态机**（页面级模块变量，不在 React 里——宿主揭示自己的面板时 MonoRoot 会被卸载，意图必须比组件活得久）
+- 置 true：`layout.panelInfo` 快照 `activePanelId === "mono"` 的每一次订阅回调，以及 `watchPanelIntent()` attach 时的首个快照。进栏按钮、恢复选中、从别的面板切回 Mono 都走这一条。
+- 置 false：**只有**工具栏「回到宿主视图」——先 `monoIntent = false` 再 `selectPanel(null)`，所以出口自身引起的 panel 变化不会被自己的弹回逮住。这是「弹回 + 出口同批交付」的硬约束：没有出口，意图一旦为真就再也关不掉。
+- 弹回触发：意图为真且 `activePanelId` 变成 `null`（Conversation）。变成别的 panel id（插件 / 自动化任务）**不弹**——那是用户主动选的面板，弹回会把人锁死在 Mono 里。
+
+**实测中修正的两处判据**（与 T04b 原文描述不同，原写法在这里跑不通）
+1. 原文把弹回挂在 `scan()` 的「会话打开」分支上：`if (host !== null && opened !== host)`。一次性 profile 的页面从首页启动，宿主没有选中任何会话 → `host` 一直是 null → 用户打开的第一个会话被当成基线吞掉，弹回一次都不触发（CDP 抓到 `dbg scan … host null boot true`）。改成显式 `primed` 基线：只有第一次 scan 算基线，且无论有没有会话都消耗掉它；之后新出现的 mainView 保留一律算打开。这修的是 preview 镜像（原生视图里点侧栏会话，标签条也会跟上一格 preview）。
+2. 弹回改由 `panelInfo` 独占判定（见上），不再依赖会话保留的变化。因为「点侧栏里**已经选中**的那个会话」是真实的宿主揭示，但保留关系没有 delta，挂在保留变化上会漏掉——正是验收第一条的主场景。
+
+**选择器如何取会话标题**：`tabTitle(byId, sessionId)` 一个函数给标签条和选择器共用——`byId[id].title || byId[id].displayTitle || id.slice(0,8)`。选择器的列表来自 `MonoRoot` 现有的 `useSessionList()` 快照 `ids`（最多 12 条，不额外发请求），「已在本栏」用 `pane.tabs.map(t => t.sessionId)` 的 Set 判断。选中 → `workspaceOpenTab(paneId, sessionId, {})`（空 opts = 常驻，不是 preview）；「新建会话」→ `sessions.create({})` 后同样以常驻标签开进该栏。
+
+**panelInfo 的订阅与释放**：`watchPanelIntent()` 在 `apply()` 里由 `ctx.effect` 调用；服务懒取（`service("layout")?.panelInfo`，取不到时 250ms × 40 重试），订阅返回的解除函数存进闭包，`ctx.effect` 的清理函数里调它（`unsubscribe` 形式也兼容），并置 `stopped` 让在途的 `setTimeout` 不再弹。弹回本身在下一个 task 里执行（`setTimeout(…, 0)`）：先让宿主的揭示事务落定，这样读到的「宿主当前会话」才是它真正选中的那一个；执行前重读面板与意图，用户此时已经点出口就不再弹。
+
+**CDP 验收（一次性 profile `/tmp/t04bhome` + headless Chrome，21/21 通过）**：进 Mono → 点 `+` 出两段选择器 → 「新建会话」进当前栏且 `preview=false` → 选一个不在栏里的已有会话，进当前栏且 `preview=false` → 点侧栏会话：仍在 Mono，该会话成为唯一 preview 标签，宿主原生输入框照常渲染 → 连点 5 次侧栏会话：仍 1 个 preview 位、1 栏 → 点「回到宿主视图」：离开 Mono → 再点侧栏会话：不被拽回 → 控制台零异常零警告。另跑两条边界：Mono 里点宿主「新建会话」（空草稿复用，会话列表无变化）也会弹回；点侧栏「插件」面板不会被拽回。
+
+**已知限制**：① 选择器列「最近会话」用的是会话列表顺序的前 12 条，不是 updatedAt 排序；② 意图为真时用户若先点「插件」再打开会话，仍会被弹回 Mono——意图是「我要待在 Mono 直到我明说」，这是判据的语义，不是 bug；③ 会话既无 title 也无 displayTitle 时标题只能显示 id 前 8 位。
 
 ---
 

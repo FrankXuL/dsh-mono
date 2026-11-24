@@ -1040,6 +1040,82 @@ window.__ModuleLoader__.load({
               renderFactorySlot(CONTENT_FACTORY, { variant: "embedded", phase: "active" })))));
     }
 
+    // ---- in-pane session picker: "+" in a tab strip -----------------------------
+    // The host's own sidebar is the only place to see sessions, and clicking one
+    // there reveals the host's Conversation panel (unmounting this one). The picker
+    // is the in-pane way to do the same thing without leaving Mono: an explicit
+    // pick is a permanent tab, not a preview (T04b item 1).
+    //
+    // Titles come from tabTitle() (tab strip) — the same title -> displayTitle ->
+    // id[0,8] fallback the tabs use: one label source, no second copy of the rule.
+    //
+    // ponytail: anchored inside the tab strip, no portal and no collision flip. A
+    // pane shorter than the list clips the popover at its bottom; add measurement
+    // only if that ever bites.
+    function SessionPicker(props) {
+      const { paneId, pane, byId } = props;
+      const held = new Set(pane.tabs.map((tab) => tab.sessionId));
+      const ids = Array.isArray(props.ids) ? props.ids.slice(0, 12) : [];
+
+      // One capture-phase pair for the whole popover: mousedown outside closes,
+      // Escape closes. The "+" that owns this picker is ignored so its own click
+      // can toggle it shut instead of close-then-reopen.
+      react.useEffect(() => {
+        const onDown = (event) => {
+          const target = event.target;
+          if (target instanceof Element) {
+            if (target.closest('[data-mono-tab-add="' + paneId + '"]') !== null) return;
+            if (target.closest("[data-mono-picker]") !== null) return;
+          }
+          props.onClose();
+        };
+        const onKey = (event) => {
+          if (event.key === "Escape") props.onClose();
+        };
+        document.addEventListener("mousedown", onDown, true);
+        document.addEventListener("keydown", onKey, true);
+        return () => {
+          document.removeEventListener("mousedown", onDown, true);
+          document.removeEventListener("keydown", onKey, true);
+        };
+        // props.onClose is a fresh closure per render; re-subscribing for it would
+        // be pointless. paneId is the only input that changes.
+      }, [paneId]);
+
+      const items = ids.length === 0
+        ? [h("div", { key: "none", className: "mono-picker-empty" }, "还没有会话")]
+        : ids.map((sessionId) => {
+          const title = tabTitle(byId, sessionId);
+          const inPane = held.has(sessionId);
+          return h("button", {
+            key: sessionId,
+            type: "button",
+            className: "mono-picker-item" + (inPane ? " mono-picker-item-held" : ""),
+            title,
+            "data-mono-picker-item": sessionId,
+            "data-mono-picker-held": inPane ? "true" : "false",
+            onClick: () => props.onPick(sessionId),
+          },
+            h("span", { className: "mono-picker-title" }, title),
+            inPane ? h("span", { className: "mono-picker-check", "aria-hidden": true }, "\u2713") : null);
+        });
+
+      return h("div", {
+        className: "mono-picker",
+        role: "dialog",
+        "aria-label": "Open a session",
+        "data-mono-picker": paneId,
+      },
+        h("button", {
+          type: "button",
+          className: "mono-picker-new",
+          "data-mono-picker-new": "true",
+          onClick: () => props.onNew(),
+        }, "新建会话"),
+        h("div", { className: "mono-picker-head" }, "最近会话"),
+        items);
+    }
+
     // ---- tab strip: one tab per session in a pane -------------------------------
     // A tab's label is the host's own displayTitle (durable title, else workspace
     // basename, else id). The tab strip exists because the native session header is
@@ -1059,9 +1135,16 @@ window.__ModuleLoader__.load({
      * data-mono-preview / .mono-tab-preview is the transient state: italic title,
      * replaced by the next session opened in this pane, promoted on double click,
      * Enter, or the first prompt sent inside it.
+     *
+     * The "+" opens the in-pane session picker (SessionPicker), not a bare create:
+     * a session opened from the host sidebar reveals the host's panel, and the
+     * picker is how the same thing is done without leaving Mono.
      */
     function TabStrip(props) {
       const { paneId, pane, byId } = props;
+      // Local to one strip: a pane is only remounted (split) with an empty strip,
+      // so there is no open picker to lose.
+      const [pickerOpen, setPickerOpen] = react.useState(false);
       const items = pane.tabs.map((tab, index) => {
         const title = tabTitle(byId, tab.sessionId);
         const active = index === pane.activeIndex;
@@ -1104,13 +1187,32 @@ window.__ModuleLoader__.load({
         key: "new-tab",
         type: "button",
         className: "mono-tab-add",
-        title: "New session",
-        "aria-label": "New session",
+        title: "Open session",
+        "aria-label": "Open session",
+        "aria-expanded": pickerOpen ? "true" : "false",
         "data-mono-tab-add": paneId,
         onMouseDown: (event) => event.stopPropagation(),
-        onClick: () => props.onOpenSession(paneId),
+        onClick: () => setPickerOpen((open) => !open),
       }, "+"));
-      return h("div", { className: "mono-tabs", role: "tablist", "data-mono-tabs": paneId }, items);
+
+      // The wrapper only exists to anchor the popover: .mono-tabs scrolls, and a
+      // scrolling box clips an absolutely positioned child.
+      return h("div", { className: "mono-tabstrip" },
+        h("div", { className: "mono-tabs", role: "tablist", "data-mono-tabs": paneId }, items),
+        pickerOpen
+          ? h(SessionPicker, {
+            paneId,
+            pane,
+            byId,
+            ids: props.ids,
+            onPick: (sessionId) => {
+              setPickerOpen(false);
+              if (typeof props.onPickSession === "function") props.onPickSession(paneId, sessionId);
+            },
+            onNew: () => { setPickerOpen(false); props.onOpenSession(paneId); },
+            onClose: () => setPickerOpen(false),
+          })
+          : null);
     }
 
     // ---- split tree -> flex boxes ----------------------------------------------
@@ -1158,6 +1260,8 @@ window.__ModuleLoader__.load({
             paneId,
             pane,
             byId: props.byId,
+            ids: props.ids,
+            onPickSession: props.onPickSession,
             onActivateTab: props.onActivateTab,
             onCloseTab: props.onCloseTab,
             onPromoteTab: props.onPromoteTab,
@@ -1214,7 +1318,7 @@ window.__ModuleLoader__.load({
     const PERSIST_KEY = "dsh-mono:workspace:v1";
 
     /** CSS text, inlined from src/client/style.css. */
-    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n";
+    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
 
     // ---- plugin root -----------------------------------------------------------
     /** Services resolve lazily: cordis may materialise them after apply() ran. */
@@ -1249,6 +1353,15 @@ window.__ModuleLoader__.load({
     const nextPaneId = () => "pane-" + ++paneSeq;
 
     /**
+     * The user's intent to sit in Mono — page-level on purpose: MonoRoot unmounts
+     * every time the host reveals a panel of its own, and the bounce has to outlive
+     * it. Set true by entering Mono; cleared ONLY by the toolbar exit (T04b: the
+     * exit ships with the bounce, otherwise the bounce traps the user).
+     */
+    let monoIntent = false;
+
+
+    /**
      * The host's own session open is not ours to observe: uiWorkspace.openSession
      * reveals the Conversation main panel (layout.selectPanel(null)), which unmounts
      * this one. Its side effects stay visible, and they are what the tab strip
@@ -1258,8 +1371,10 @@ window.__ModuleLoader__.load({
      *    so a new mainView id means "the user just opened a session";
      *  - the prompt sent inside it moves that session's own snapshot, which Pane
      *    reports as a use (see watchPreviewUse below).
-     * It never calls layout.selectPanel("mono") to yank the user back: Mono is an
-     * addition to the host UI, not a replacement (plan.md decision 1).
+     * It does call layout.selectPanel("mono") after such an open — but only while
+     * the user's intent is Mono (monoIntent below). The toolbar exit clears that
+     * intent, and the two ship together: without the exit the bounce would trap
+     * the user inside Mono (T04b).
      */
     // Preview tabs promote when the session is actually used. A session opened from
     // the sidebar is prompted in the host's own Conversation panel (opening it
@@ -1297,6 +1412,98 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * The session the host is showing: the one it retains for mainView. Read at
+     * bounce time, because the reveal does not always change the list (clicking the
+     * session that is already selected re-reveals it without a retention delta).
+     */
+    function hostMainSession() {
+      const list = service("sessions")?.list;
+      if (list === undefined) return undefined;
+      try {
+        const snapshot = list.getSnapshot();
+        const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
+        return ids.find((id) => (snapshot.byId?.[id]?.retainedBy?.mainView ?? 0) > 0);
+      } catch { return undefined; }
+    }
+
+    /** Reveal Mono when the intent says Mono. No-op when already there. */
+    function bounceToMono() {
+      const layout = service("layout");
+      if (layout === undefined || typeof layout.selectPanel !== "function") return;
+      try {
+        if (layout.panelInfo?.getSnapshot?.()?.activePanelId === PANEL_ID) return;
+        layout.selectPanel(PANEL_ID);
+      } catch (error) {
+        // selectPanel throws when the main key is not registered (host torn down).
+        log("bounce back failed", String(error));
+      }
+    }
+
+    /**
+     * monoIntent is page-level state, so the subscription lives in apply(), not in
+     * a component: the host unmounts MonoRoot whenever it reveals one of its own
+     * panels, and the intent must survive that. Two rules, no timer between them:
+     *  - looking at Mono sets the intent;
+     *  - the panel turning into the Conversation never clears it — that reveal is
+     *    the host open this feature answers. Only the toolbar exit clears it.
+     *
+     * Services are resolved lazily and retried like watchSessions: cordis may
+     * materialise a service slightly after apply(). The returned disposer is what
+     * ctx.effect releases on unload.
+     */
+    function watchPanelIntent() {
+      let stopped = false;
+      let unlisten = null;
+      let attempts = 0;
+
+      const attach = () => {
+        if (stopped) return;
+        const source = service("layout")?.panelInfo;
+        if (source === undefined || typeof source.subscribe !== "function") {
+          if (attempts++ < 40) setTimeout(attach, 250);
+          return;
+        }
+        const activePanel = () => {
+          try { return source.getSnapshot()?.activePanelId ?? null; } catch { return null; }
+        };
+        // Opening Mono from the sidebar is the ordinary case; a page that starts on
+        // Mono (restored selection) is the same intent.
+        if (activePanel() === PANEL_ID) monoIntent = true;
+        const off = source.subscribe(() => {
+          if (activePanel() === PANEL_ID) {
+            monoIntent = true;
+            return;
+          }
+          // null is the Conversation: either the host opened a session or the user
+          // left through it. Any other id is another global panel the user picked
+          // on purpose — clicking 插件 must not yank them back into Mono.
+          if (activePanel() !== null || !monoIntent) return;
+          // Settle on the next task: the host's reveal transaction finishes first,
+          // so the session id below is the one it actually selected.
+          setTimeout(() => {
+            if (stopped || !monoIntent || activePanel() !== null) return;
+            const sessionId = hostMainSession();
+            if (sessionId !== undefined) workspaceOpenTab(workspaceActivePane(), sessionId, { preview: true });
+            bounceToMono();
+          }, 0);
+        });
+        unlisten = typeof off === "function" ? off
+          : off !== undefined && off !== null && typeof off.unsubscribe === "function"
+            ? () => off.unsubscribe()
+            : null;
+      };
+
+      attach();
+      return () => {
+        stopped = true;
+        if (unlisten !== null) {
+          try { unlisten(); } catch (error) { log("layout unsubscribe failed", String(error)); }
+          unlisten = null;
+        }
+      };
+    }
+
     let watching = false;
     function watchSessions(sessions, attempts = 0) {
       if (watching) return;
@@ -1307,6 +1514,7 @@ window.__ModuleLoader__.load({
       }
       watching = true;
       let host = null;
+      let primed = false;
       const scan = () => {
         let snapshot;
         try { snapshot = list.getSnapshot(); } catch { return; }
@@ -1315,8 +1523,19 @@ window.__ModuleLoader__.load({
         // ponytail: first positive mainView in list order covers the instant the
         // host holds two (retain new, then release old); the next scan settles it.
         const opened = ids.find((id) => (byId[id]?.retainedBy?.mainView ?? 0) > 0);
+        // Only the first scan is the baseline: a session the host already had
+        // selected at boot is not a fresh open. The baseline is consumed even when
+        // nothing is retained (a page that boots on the home screen), otherwise the
+        // first session opened afterwards would be swallowed as the baseline and
+        // the bounce would never latch.
+        const booting = !primed;
+        primed = true;
         if (opened === undefined) return;
-        if (host !== null && opened !== host) {
+        if (!booting && opened !== host) {
+          // Mirror the host's open into this pane. The bounce back to Mono is not
+          // this branch's job: watchPanelIntent owns it, keyed on the panel turning
+          // into the Conversation, because that reveal also happens without a list
+          // change (re-clicking the session the host already shows).
           workspaceOpenTab(workspaceActivePane(), opened, { preview: true });
         }
         host = opened;
@@ -1383,6 +1602,16 @@ window.__ModuleLoader__.load({
         );
       };
 
+      // The way back to the host's own view, and the only thing that clears the
+      // intent: leaving through the host (clicking a sidebar session) is answered
+      // by the bounce, so without this button Mono would be a one-way door.
+      const exitToHost = () => {
+        monoIntent = false;
+        const host = service("layout");
+        if (host === undefined || typeof host.selectPanel !== "function") { log("no layout service"); return; }
+        try { host.selectPanel(null); } catch (error) { log("exit to host failed", String(error)); }
+      };
+
       return h("div", { className: "mono-root" },
         h("div", { className: "mono-toolbar" },
           h("button", {
@@ -1391,9 +1620,19 @@ window.__ModuleLoader__.load({
             title: "Split right",
             "aria-label": "Split right",
             onClick: () => workspaceSplit(layout.active, nextPaneId()),
-          }, "+")),
+          }, "+"),
+          h("button", {
+            type: "button",
+            className: "mono-tool-btn mono-tool-exit",
+            title: "回到宿主视图",
+            "aria-label": "回到宿主视图",
+            "data-mono-exit": "true",
+            onClick: exitToHost,
+          }, "回到宿主视图")),
         h(PaneTree, {
           tree: layout.tree,
+          ids: listState?.ids,
+          onPickSession: (paneId, sessionId) => workspaceOpenTab(paneId, sessionId, {}),
           panes: layout.panes,
           byId: listState?.byId,
           activePaneId: layout.active,
@@ -1410,10 +1649,16 @@ window.__ModuleLoader__.load({
     }
 
     const MONO_PLUGIN = {
-      inject: ["slots"],
+      // layout is read for the occupancy and written only on the user's behalf:
+      // selectPanel("mono") is the bounce, selectPanel(null) is the exit they asked
+      // for by pressing the button.
+      inject: ["slots", "layout"],
       apply(ctx) {
         CTX = ctx;
         ensureStyle();
+        // Page-level, not panel-level: it has to keep receiving panel switches while
+        // MonoRoot is unmounted.
+        ctx.effect(watchPanelIntent);
         // The \`children\` declaration is load-bearing: it is what makes the host
         // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
         // the panes render the "no SessionProvider" fallback. Cost: with a dead
