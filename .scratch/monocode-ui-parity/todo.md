@@ -284,6 +284,17 @@ ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅�
 **CDP 验收（一次性 profile `/tmp/t04bhome` + headless Chrome，21/21 通过）**：进 Mono → 点 `+` 出两段选择器 → 「新建会话」进当前栏且 `preview=false` → 选一个不在栏里的已有会话，进当前栏且 `preview=false` → 点侧栏会话：仍在 Mono，该会话成为唯一 preview 标签，宿主原生输入框照常渲染 → 连点 5 次侧栏会话：仍 1 个 preview 位、1 栏 → 点「回到宿主视图」：离开 Mono → 再点侧栏会话：不被拽回 → 控制台零异常零警告。另跑两条边界：Mono 里点宿主「新建会话」（空草稿复用，会话列表无变化）也会弹回；点侧栏「插件」面板不会被拽回。
 
 **已知限制**：① 选择器列「最近会话」用的是会话列表顺序的前 12 条，不是 updatedAt 排序；② 意图为真时用户若先点「插件」再打开会话，仍会被弹回 Mono——意图是「我要待在 Mono 直到我明说」，这是判据的语义，不是 bug；③ 会话既无 title 也无 displayTitle 时标题只能显示 id 前 8 位。
+**审查（独立复验，2026-11-24，另一会话）**：一次性 profile `dev-mono` + 无头 Chrome CDP，视口 1680×1050，全程零 console error/warning、零未捕获异常；构建幂等、`node --check client.js`、`node src/client/state/workspace.js` 全绿。
+
+7 条验收逐条实测通过，另有 4 条超出验收的实证：① 已有**常驻**标签再被侧栏点一次不会被降级成 preview（`openTabInPane` 对已存在标签提前 return，preview 位不受影响）；② 退出再进 Mono，标签与布局都在（页面级 store 生效）；③ 分栏后弹回的 preview 落到**最后点击的那一栏**（`activePaneId` 由 `PaneTree` 的 `onMouseDown` 更新）；④ 选择器 Esc / 点外部都能关。
+
+三条缺陷（均未修，待排期）：
+
+1. **中｜`monoIntent` 跨面板泄漏**：Mono → 点「插件」→ 点侧栏会话 → **被拽回 Mono**。`src/client/index.js:156-158` 的注释写的是「任何别的 panel 是用户主动选的，点插件不能把人拽回 Mono」，但代码只做到「当场不弹」：`src/client/index.js:159` 的 `if (activePanel() !== null || !monoIntent) return;` 没清意图，于是下一次点会话就弹。修法一行：`if (activePanel() !== null) { monoIntent = false; return; }`（`null`=Conversation 才保留意图，那正是要弹回的场合）。
+2. **低｜选择器点「已在本栏的预览标签」不转正**：`src/client/state/workspace.js:53` 对已存在标签提前 return（注释：Switching tabs must not touch preview state.），`SessionPicker` 的 `onPick` 走 `workspaceOpenTab(paneId, sessionId, {})`（`preview=false`）被吞掉。从菜单里显式选中应算「转正」，现在只能双击标签。修法：picker 的 onPick 走 `workspacePromoteTab`，或给 `openTabInPane` 加 promote 选项。
+3. **低｜选择器列的是全应用会话，不是当前工作区**：列表来自 `useSessionList().ids`。实测侧栏 1 条（当前工作区 `087815aa`），选择器 4 条（含 `--private-tmp--` 工作区的 3 条），其中 3 条标题都叫 `tmp` 无法区分；且 `087815aa` 侧栏叫「新会话」、选择器叫 `default-workspace`——`tabTitle`（`title → displayTitle → id 前 8 位`）与侧栏取标题的来源不同。要么按工作区过滤，要么在选择器里标出所属工作区。
+
+审查用的一次性 profile `/tmp/t04bhome` 与 CDP 脚本（`/tmp/revlib.mjs` 等）都在 `/tmp`，未碰 desktop profile。
 
 ---
 
