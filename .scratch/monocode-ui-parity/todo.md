@@ -296,6 +296,27 @@ ctx.layout.panelInfo 是 HostObservable，在 apply() 里用 ctx.effect 订阅�
 
 审查用的一次性 profile `/tmp/t04bhome` 与 CDP 脚本（`/tmp/revlib.mjs` 等）都在 `/tmp`，未碰 desktop profile。
 
+### [ ] T04c — 修 T04b 三条缺陷（约半天）
+
+**目标**：把独立审查开出的三条缺陷修掉。三条都有确定的复现路径，不需要再调研。
+
+**要做**
+
+1. **意图泄漏（中）**：`src/client/index.js:159` 改成 `if (activePanel() !== null) { monoIntent = false; return; }`。`activePanel() === null` 表示 Conversation（宿主原生会话视图）——那正是该弹回的场合，意图要留着继续往下走；用户主动点是**别的**面板（插件/日程等），意图就该清掉，否则下一次点侧栏会话会被拽回来。
+2. **选择器点已在本栏的预览标签应转正（低）**：`src/client/index.js:313` 的 `onPickSession` 改成先 `workspacePromoteSession(sessionId)` 再 `workspaceOpenTab(paneId, sessionId, {})`。`workspacePromoteSession` 已经存在（`src/client/state/workspace.js:164`），会清掉所有栏里该会话的 preview 标记；`openTabInPane` 对已存在标签提前 return 的行为**不要改**（切标签不该动 preview 状态，那是给别的入口用的）。
+3. **选择器要与侧栏一致（低）**：现在列的是 `useSessionList().ids` 原始全集，实测把别的工作区的会话也列了出来（4 条 vs 侧栏 1 条），还出现多条同标题 `tmp` 无法区分。要求：
+   - 只列当前工作区的会话；空白会话按宿主自己的规则只保留当前选中的那条（宿主的规则在 `@deepseek-ai/dsh-client-ui-workspace/src/client/rows/WorkspaceBrowser.tsx`：`session.blank` + archived 过滤，包内 `src` 可直接读：`/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/...`）；
+   - 若插件拿不到工作区归属（`sessions` 服务的 snapshot 只有 `ids`/`byId`，行里不一定有 workspace 字段），退一步：在选择器每行标出所属工作区或 cwd 名，让同名会话能区分，并在这里记下为什么降级。
+
+**过关**
+
+- Mono → 点「插件」→ 点侧栏会话：**留在插件面板**，不被拽回；再回 Mono 点侧栏会话，弹回仍然生效（意图没修坏）
+- 选择器点一个已在本栏、且是 preview 的会话：该标签转正（星号消失），不新增标签
+- 选择器里不再出现别的工作区的会话（或每行标出工作区名）；同名多条能区分
+- `npm run build` + `node --check client.js` + `node src/client/state/workspace.js` 全绿，控制台零异常
+
+**Prompt**：见 T05 的 Prompt（T04c 与 T05 同批下发，分两次提交）。
+
 ---
 
 ### [ ] T05 — 拖拽分栏
