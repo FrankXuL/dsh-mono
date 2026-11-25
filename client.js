@@ -747,6 +747,16 @@ window.__ModuleLoader__.load({
       return workspaceState;
     }
 
+    /**
+     * Install a layout restored from storage before the first paint. Same contract
+     * as workspaceStart: render-time, no notify, and never replaces a live state.
+     */
+    function workspaceRestore(state) {
+      if (workspaceState !== null || state === null || state === undefined) return workspaceState;
+      workspaceState = state;
+      return workspaceState;
+    }
+
     /** Last Session the host showed (retained as mainView), if seen. */
     function workspaceHostSelection() { return hostSelection; }
 
@@ -1631,9 +1641,336 @@ window.__ModuleLoader__.load({
     }
 
     // ---- persistence -----------------------------------------------------------
-    // T06 fills this in: serialize the tree + per-pane tabs to localStorage.
-    // ponytail: no storage code exists before there is a tree to store.
+    // The read/write layer of state/workspace.js — never a second copy of the
+    // layout. One JSON document holds exactly the store's shape:
+    //
+    //   { version: 1,
+    //     tree:    { type: "split" | "leaf", ... , sizes: [...] },
+    //     panes:   { [paneId]: { tabs: [{ sessionId, preview }], activeIndex } },
+    //     active:  paneId }
+    //
+    // ponytail: whole-document rewrite, not per-pane keys. One localStorage key is
+    // ~1KB; a diff format buys nothing and has to be migrated forever.
+    //
+    // Restoring is all-or-nothing: a tree node that is not a well-formed leaf or
+    // split discards the document and the caller falls back to one empty pane. A
+    // half-restored tree is worse than no tree. Dead session ids are the one
+    // exception: they are dropped per tab (see pruneWorkspaceSessions), because the
+    // pane itself is still meaningful and keeps its width.
+
     const PERSIST_KEY = "dsh-mono:workspace:v1";
+    const PERSIST_VERSION = 1;
+    // Drag and sash drag notify on every pointermove. 200ms coalescing turns a
+    // gesture into a handful of writes; pagehide/visibilitychange flush the tail.
+    const PERSIST_SAVE_DELAY = 200;
+
+    const persistIsObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+
+    const persistClampIndex = (index, length) => {
+      if (length <= 0) return 0;
+      const value = Number.isFinite(index) ? Math.floor(index) : 0;
+      return value < 0 ? 0 : value > length - 1 ? length - 1 : value;
+    };
+
+    let persistSplitSeq = 0;
+    const persistNextSplitId = () => "r" + (++persistSplitSeq).toString(36);
+
+    /** Store state -> the JSON document (plain data, safe to stringify). */
+    function captureWorkspace(state) {
+      const panes = {};
+      for (const paneId of Object.keys(state.panes)) {
+        const pane = state.panes[paneId];
+        panes[paneId] = {
+          tabs: pane.tabs.map((tab) => ({ sessionId: tab.sessionId, preview: tab.preview === true })),
+          activeIndex: persistClampIndex(pane.activeIndex, pane.tabs.length),
+        };
+      }
+      return { version: PERSIST_VERSION, tree: state.tree, panes, active: state.active };
+    }
+
+    /**
+     * Validate one stored node and rebuild it. paneIds is the seen-leaf set:
+     * duplicate pane ids are as invalid as an unknown node type.
+     */
+    function restoreTree(node, paneIds) {
+      if (!persistIsObject(node)) return null;
+      if (node.type === "leaf") {
+        if (typeof node.paneId !== "string" || node.paneId === "" || paneIds.has(node.paneId)) return null;
+        paneIds.add(node.paneId);
+        return { type: "leaf", paneId: node.paneId };
+      }
+      if (node.type !== "split" || (node.dir !== "row" && node.dir !== "column")) return null;
+      if (!Array.isArray(node.children) || node.children.length < 2) return null;
+      const children = [];
+      for (const child of node.children) {
+        const restored = restoreTree(child, paneIds);
+        if (restored === null) return null;
+        children.push(restored);
+      }
+      const sizes = node.sizes;
+      if (!Array.isArray(sizes) || sizes.length !== children.length) return null;
+      if (!sizes.every((size) => Number.isFinite(size) && size > 0)) return null;
+      const total = sizes.reduce((sum, size) => sum + size, 0);
+      if (!(total > 0)) return null;
+      return {
+        type: "split",
+        // Split ids only feed sash drag (T07); a stored one is reused so the page
+        // that restores it addresses the same split it saved.
+        id: typeof node.id === "string" && node.id !== "" ? node.id : persistNextSplitId(),
+        dir: node.dir,
+        children,
+        sizes: sizes.map((size) => size / total),
+      };
+    }
+
+    /** Every leaf must have a coherent pane; a pane with no entry is half a tree. */
+    function restorePanes(raw, paneIds) {
+      if (!persistIsObject(raw)) return null;
+      const panes = {};
+      for (const paneId of paneIds) {
+        const pane = raw[paneId];
+        if (!persistIsObject(pane) || !Array.isArray(pane.tabs)) return null;
+        const tabs = [];
+        const seen = new Set();
+        for (const tab of pane.tabs) {
+          if (!persistIsObject(tab) || typeof tab.sessionId !== "string" || tab.sessionId === "") return null;
+          // Two tabs for one session would fight over one React key and one retain.
+          if (seen.has(tab.sessionId)) return null;
+          seen.add(tab.sessionId);
+          tabs.push({ sessionId: tab.sessionId, preview: tab.preview === true });
+        }
+        panes[paneId] = { tabs, activeIndex: persistClampIndex(pane.activeIndex, tabs.length) };
+      }
+      return panes;
+    }
+
+    /** Parsed document -> store state, or null when any part is not ours. */
+    function restoreWorkspaceData(data) {
+      if (!persistIsObject(data) || data.version !== PERSIST_VERSION) return null;
+      const paneIds = new Set();
+      const tree = restoreTree(data.tree, paneIds);
+      if (tree === null || paneIds.size === 0) return null;
+      const panes = restorePanes(data.panes, paneIds);
+      if (panes === null) return null;
+      const firstPaneId = paneIds.values().next().value;
+      const active = typeof data.active === "string" && paneIds.has(data.active) ? data.active : firstPaneId;
+      return { tree, panes, active };
+    }
+
+    function persistStorage() {
+      try { return typeof localStorage === "undefined" ? null : localStorage; } catch { return null; }
+    }
+
+    /**
+     * Read + validate the stored layout. Unknown versions, garbage JSON and illegal
+     * nodes all yield null (single-pane fallback) and clear the bad key; nothing
+     * here throws at the caller.
+     */
+    function restoreWorkspaceState(storage = persistStorage()) {
+      if (storage === null) return null;
+      let raw;
+      try { raw = storage.getItem(PERSIST_KEY); } catch { return null; }
+      if (typeof raw !== "string" || raw === "") return null;
+      let data = null;
+      try { data = JSON.parse(raw); } catch { data = null; }
+      const state = restoreWorkspaceData(data);
+      if (state === null) {
+        try { storage.removeItem(PERSIST_KEY); } catch {}
+      }
+      return state;
+    }
+
+    /**
+     * Drop tabs whose session the host no longer lists. The pane survives even when
+     * every tab in it dies — its leaf and split sizes are untouched — so the empty
+     * state keeps the width the user gave it. Returns null when nothing changed, so
+     * workspaceUpdate can keep the identity and skip a notify/write.
+     */
+    function pruneWorkspaceSessions(state, aliveIds) {
+      if (!persistIsObject(state) || !persistIsObject(state.panes) || !(aliveIds instanceof Set)) return null;
+      let changed = false;
+      const panes = {};
+      for (const paneId of Object.keys(state.panes)) {
+        const pane = state.panes[paneId];
+        const tabs = Array.isArray(pane?.tabs) ? pane.tabs : [];
+        const kept = tabs.filter((tab) => aliveIds.has(tab.sessionId));
+        if (kept.length === tabs.length) { panes[paneId] = pane; continue; }
+        changed = true;
+        const activeSession = tabs[pane.activeIndex]?.sessionId;
+        const keptActive = activeSession !== undefined && aliveIds.has(activeSession)
+          ? kept.findIndex((tab) => tab.sessionId === activeSession)
+          : persistClampIndex(pane.activeIndex, kept.length);
+        panes[paneId] = { tabs: kept, activeIndex: keptActive < 0 ? 0 : keptActive };
+      }
+      return changed ? { ...state, panes } : null;
+    }
+
+    /**
+     * Trailing-edge coalescer over a write callback. schedule() is idempotent until
+     * the timer fires; flush() writes the pending change immediately (pagehide,
+     * visibilitychange) and is a no-op when nothing is dirty.
+     */
+    function createPersistWriter(write, delay = PERSIST_SAVE_DELAY) {
+      let timer = null;
+      let dirty = false;
+      const run = () => {
+        timer = null;
+        if (!dirty) return;
+        dirty = false;
+        try { write(); } catch (error) { log("persist write failed", String(error)); }
+      };
+      return {
+        schedule() {
+          dirty = true;
+          if (timer === null) timer = setTimeout(run, delay);
+        },
+        flush() {
+          if (timer !== null) { clearTimeout(timer); timer = null; }
+          if (!dirty) return;
+          dirty = false;
+          try { write(); } catch (error) { log("persist write failed", String(error)); }
+        },
+        pending() { return dirty; },
+        cancel() {
+          if (timer !== null) { clearTimeout(timer); timer = null; }
+          dirty = false;
+        },
+      };
+    }
+
+    /**
+     * Page-lifetime persistence. Subscribes to the one store; writes are coalesced.
+     * Returns the disposer cordis effects expect.
+     */
+    function startWorkspacePersistence() {
+      const storage = persistStorage();
+      if (storage === null) return undefined;
+      const writer = createPersistWriter(() => {
+        const state = workspaceGet();
+        if (state === null) return;
+        storage.setItem(PERSIST_KEY, JSON.stringify(captureWorkspace(state)));
+      });
+      const unsubscribe = workspaceSubscribe(() => writer.schedule());
+      const flush = () => writer.flush();
+      const onVisibility = () => {
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") writer.flush();
+      };
+      if (typeof window !== "undefined") window.addEventListener("pagehide", flush);
+      if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisibility);
+      return () => {
+        writer.cancel();
+        unsubscribe();
+        if (typeof window !== "undefined") window.removeEventListener("pagehide", flush);
+        if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisibility);
+      };
+    }
+
+    // ---- self-check: node src/client/persist/index.js ---------------------------
+    function persistSelfCheck(assert) {
+      const splitTree = {
+        type: "split",
+        id: "s-test",
+        dir: "row",
+        sizes: [0.6, 0.4],
+        children: [
+          { type: "leaf", paneId: "pane-1" },
+          { type: "leaf", paneId: "pane-2" },
+        ],
+      };
+      const state = {
+        tree: splitTree,
+        panes: {
+          "pane-1": { tabs: [{ sessionId: "s1", preview: false }, { sessionId: "s2", preview: true }], activeIndex: 1 },
+          "pane-2": { tabs: [], activeIndex: 0 },
+        },
+        active: "pane-2",
+      };
+
+      // Round trip: tree (with sizes), tabs, preview flag, activeIndex, active pane.
+      const data = captureWorkspace(state);
+      assert.equal(data.version, 1);
+      assert.deepEqual(restoreWorkspaceData(JSON.parse(JSON.stringify(data))), state);
+
+      // Unknown version and garbage are discarded, never thrown.
+      assert.equal(restoreWorkspaceData({ ...data, version: 99 }), null);
+      assert.equal(restoreWorkspaceData(null), null);
+      assert.equal(restoreWorkspaceData({ version: 1, tree: { type: "wat" }, panes: {} }), null);
+      // A split needs two children and one size each.
+      assert.equal(restoreWorkspaceData({
+        ...data,
+        tree: { type: "split", id: "x", dir: "row", sizes: [1], children: [{ type: "leaf", paneId: "pane-1" }] },
+      }), null);
+      // Duplicate pane ids and missing pane entries are not a half tree to render.
+      assert.equal(restoreWorkspaceData({
+        ...data,
+        tree: { type: "split", id: "x", dir: "row", sizes: [0.5, 0.5], children: [{ type: "leaf", paneId: "pane-1" }, { type: "leaf", paneId: "pane-1" }] },
+      }), null);
+      assert.equal(restoreWorkspaceData({ ...data, panes: { "pane-1": state.panes["pane-1"] } }), null);
+      // Sizes must be positive finite numbers; they renormalize to 1.
+      assert.equal(restoreWorkspaceData({ ...data, tree: { ...splitTree, sizes: [0, 1] } }), null);
+      assert.deepEqual(restoreWorkspaceData({ ...data, tree: { ...splitTree, sizes: [3, 1] } }).tree.sizes, [0.75, 0.25]);
+
+      // A single leaf is a valid layout (the one-pane case), not a broken tree.
+      const single = restoreWorkspaceData({
+        version: 1,
+        tree: { type: "leaf", paneId: "solo" },
+        panes: { solo: { tabs: [{ sessionId: "s1", preview: false }], activeIndex: 0 } },
+        active: "solo",
+      });
+      assert.equal(single.tree.paneId, "solo");
+      assert.equal(single.active, "solo");
+
+      // Dead sessions: dropped per tab, active follows the surviving tab, an
+      // all-dead pane stays (empty) with its width owned by the tree.
+      const pruned = pruneWorkspaceSessions({
+        tree: splitTree,
+        panes: {
+          "pane-1": { tabs: [{ sessionId: "s1", preview: false }, { sessionId: "dead", preview: false }, { sessionId: "s3", preview: false }], activeIndex: 1 },
+          "pane-2": { tabs: [{ sessionId: "gone", preview: false }], activeIndex: 0 },
+        },
+        active: "pane-1",
+      }, new Set(["s1", "s3"]));
+      assert.deepEqual(pruned.panes["pane-1"], { tabs: [{ sessionId: "s1", preview: false }, { sessionId: "s3", preview: false }], activeIndex: 1 });
+      assert.deepEqual(pruned.panes["pane-2"], { tabs: [], activeIndex: 0 });
+      assert.equal(pruned.tree, splitTree);
+      // Nothing dead -> null, so the store identity (and a write) is skipped.
+      assert.equal(pruneWorkspaceSessions(state, new Set(["s1", "s2"])), null);
+
+      // Throttle: N schedules -> one write at the trailing edge; flush is immediate
+      // and clears the timer; a flushed writer is not dirty any more.
+      let writes = 0;
+      const writer = createPersistWriter(() => { writes += 1; }, 10_000);
+      writer.schedule();
+      writer.schedule();
+      writer.schedule();
+      assert.equal(writes, 0);
+      assert.equal(writer.pending(), true);
+      writer.flush();
+      assert.equal(writes, 1);
+      assert.equal(writer.pending(), false);
+      writer.flush();
+      assert.equal(writes, 1);
+      writer.schedule();
+      writer.flush();
+      assert.equal(writes, 2);
+      writer.cancel();
+
+      console.log("  ok workspace persistence checks");
+    }
+
+    const isDirectPersistRun = typeof process !== "undefined"
+      && typeof window === "undefined"
+      && typeof document === "undefined"
+      && /(^|[\\/])persist[\\/]index\.js$/.test(process.argv?.[1] ?? "");
+
+    if (isDirectPersistRun) {
+      import("node:assert/strict")
+        .then(({ default: assert }) => persistSelfCheck(assert))
+        .catch((error) => {
+          console.error(error);
+          process.exitCode = 1;
+        });
+    }
 
     /** CSS text, inlined from src/client/style.css. */
     const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n/* While a tab is in flight: no text selection, and the whole window shows the\n   grab cursor even when the pointer is over another pane's content. */\nbody.mono-dragging {\n  user-select: none;\n  cursor: grabbing;\n}\n\nbody.mono-dragging .mono-tab {\n  cursor: grabbing;\n}\n\n/* Drop hint: fixed overlays (never part of the flex layout), one wash for the\n   half the new pane will occupy, one 2px accent line on the split itself. */\n.mono-drop-wash {\n  position: fixed;\n  z-index: 70;\n  pointer-events: none;\n  background: var(--dsh-accent-wash, rgba(106, 141, 255, 0.14));\n  border-radius: 4px;\n}\n\n.mono-drop-line {\n  position: fixed;\n  z-index: 71;\n  pointer-events: none;\n  background: var(--dsh-accent, #6a8dff);\n  border-radius: 1px;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
@@ -1666,9 +2003,14 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Pane ids only have to be unique within this page. */
+    /** Pane ids only have to be unique within this page; restored ids are already taken. */
     let paneSeq = 0;
-    const nextPaneId = () => "pane-" + ++paneSeq;
+    const nextPaneId = () => {
+      const taken = new Set(Object.keys(workspaceGet()?.panes ?? {}));
+      let id;
+      do { id = "pane-" + ++paneSeq; } while (taken.has(id));
+      return id;
+    };
 
     /**
      * The user's intent to sit in Mono — page-level on purpose: MonoRoot unmounts
@@ -1826,6 +2168,16 @@ window.__ModuleLoader__.load({
       };
     }
 
+    /** Sessions the host has archived: the layout treats them as gone. */
+    function archivedSessionIds() {
+      const list = service("workspaces")?.list;
+      if (list === undefined || typeof list.getSnapshot !== "function") return new Set();
+      try {
+        const ids = list.getSnapshot()?.archivedSessionIds;
+        return new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : []);
+      } catch { return new Set(); }
+    }
+
     let watching = false;
     function watchSessions(sessions, attempts = 0) {
       if (watching) return;
@@ -1842,6 +2194,17 @@ window.__ModuleLoader__.load({
         try { snapshot = list.getSnapshot(); } catch { return; }
         const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
         const byId = snapshot?.byId ?? {};
+        // T06: stored tabs for sessions the host no longer has are dropped here.
+        // Only when the list is complete: while phase is 'pending' an empty `ids`
+        // means "not loaded yet", and pruning then would erase every tab on boot.
+        // Archived sessions stay in the session list (the host keeps their data and
+        // offers unarchive), so they are subtracted explicitly: a tab the sidebar
+        // no longer shows is a dead tab for this layout.
+        if (snapshot?.phase === "ready") {
+          const archived = archivedSessionIds();
+          const alive = new Set(ids.filter((id) => !archived.has(id)));
+          workspaceUpdate((previous) => pruneWorkspaceSessions(previous, alive) ?? previous);
+        }
         // ponytail: first positive mainView in list order covers the instant the
         // host holds two (retain new, then release old); the next scan settles it.
         const opened = ids.find((id) => (byId[id]?.retainedBy?.mainView ?? 0) > 0);
@@ -1870,7 +2233,37 @@ window.__ModuleLoader__.load({
         watching = false;
         return;
       }
+      // Archiving changes the workspace snapshot (and usually the session list too);
+      // subscribing to both means an archive prunes even when ids stay put.
+      try { service("workspaces")?.list?.subscribe?.(scan); } catch (error) {
+        log("archive watch failed", String(error));
+      }
       scan(); // baseline: the current selection is not a new open
+    }
+
+    /**
+     * A valid stored layout wins over the fresh one. Runs during render like
+     * workspaceStart: the backup key is read once, because a non-null store
+     * short-circuits before restoreWorkspaceState is called.
+     */
+    function bootWorkspace(listState) {
+      return workspaceGet()
+        ?? workspaceRestore(restoreWorkspaceState())
+        ?? workspaceStart(nextPaneId(), initialSessionId(listState));
+    }
+
+    /**
+     * The layout as it should paint. A restored tab for a session the host no longer
+     * has is left out of the very first render, before the scan effect commits the
+     * pruned store: painting it would ask the host to retain an unknown session and
+     * log a warning for a frame the user never keeps.
+     */
+    function paintedWorkspace(layout, listState) {
+      if (listState?.phase !== "ready") return layout;
+      const archived = archivedSessionIds();
+      const ids = Array.isArray(listState.ids) ? listState.ids : [];
+      const alive = new Set(ids.filter((id) => !archived.has(id)));
+      return pruneWorkspaceSessions(layout, alive) ?? layout;
     }
 
     /** Session the first pane starts with: the host's last pick, else the newest. */
@@ -1888,7 +2281,8 @@ window.__ModuleLoader__.load({
       // Page-level store: the host unmounts this panel whenever it reveals one of
       // its own, and the tabs have to survive that (state/workspace.js).
       const layout = react.useSyncExternalStore(workspaceSubscribe, workspaceGet, workspaceGet)
-        ?? workspaceStart(nextPaneId(), initialSessionId(listState));
+        ?? bootWorkspace(listState);
+      const painted = paintedWorkspace(layout, listState);
 
       react.useEffect(() => { watchSessions(service("sessions")); }, []);
 
@@ -1898,7 +2292,7 @@ window.__ModuleLoader__.load({
       // root-level hold the pane's own retain is released before the remounted one
       // acquires, the native conversation briefly resolves no binding, and its input
       // shell throws. Ref-counting in session/reference.js makes this free.
-      const heldKey = Array.from(new Set(paneSessionIds(layout.panes))).sort().join(",");
+      const heldKey = Array.from(new Set(paneSessionIds(painted.panes))).sort().join(",");
       const heldRef = react.useRef(new Set());
       react.useEffect(() => {
         if (sessions === undefined || heldKey === "") return;
@@ -1952,7 +2346,7 @@ window.__ModuleLoader__.load({
             onClick: exitToHost,
           }, "回到宿主视图")),
         h(PaneTree, {
-          tree: layout.tree,
+          tree: painted.tree,
           ids: listState?.ids,
           // A pick is an explicit choice, so it promotes. openTabInPane returns
           // early for a tab already in this pane (switching tabs must not promote a
@@ -1962,7 +2356,7 @@ window.__ModuleLoader__.load({
             workspacePromoteSession(sessionId);
             workspaceOpenTab(paneId, sessionId, {});
           },
-          panes: layout.panes,
+          panes: painted.panes,
           byId: listState?.byId,
           activePaneId: layout.active,
           onActivate: workspaceSetActivePane,
@@ -1986,8 +2380,9 @@ window.__ModuleLoader__.load({
         CTX = ctx;
         ensureStyle();
         // Page-level, not panel-level: it has to keep receiving panel switches while
-        // MonoRoot is unmounted.
+        // MonoRoot is unmounted, and a write on the way out must not be dropped.
         ctx.effect(watchPanelIntent);
+        ctx.effect(startWorkspacePersistence);
         // The \`children\` declaration is load-bearing: it is what makes the host
         // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
         // the panes render the "no SessionProvider" fallback. Cost: with a dead

@@ -427,7 +427,7 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 ---
 
-### [ ] T06 — 布局持久化
+### [x] T06 — 布局持久化
 
 **目标**：关掉重开，栏数/栏宽/每栏标签/当前标签全部还原。
 
@@ -459,6 +459,18 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 完成后：报告存储的 JSON 形状、失效会话的清理逻辑、以及节流策略。
 ```
+
+**实测（真宿主 /tmp/t06home + CDP，1680×1050，控制台零 error/warning）**
+
+存储形状（整份写入，约 400B）：`{version:1, tree:{type:"split"|"leaf", id, dir:"row", children, sizes}, panes:{"pane-1":{tabs:[{sessionId,preview}], activeIndex}}, active:"pane-3"}`。
+
+- ① 三栏各放标签、sizes `[0.5,0.3,0.2]` → 连刷两次，DOM 栏数/坐标/宽度/标签/activeIndex 完全一致（`{x:288,w:686}`、`{x:980,w:412}`、`{x:1398,w:274}`）；T07 尚未实现 sash，宽度用预置 sizes 验证。
+- ② 宿主侧栏「归档会话」session-f05859b4 → 立刻 + 刷新后：该标签消失，pane-1 仍在且保留宽度，pane-1 里另一条标签与 activeIndex 正确前移，存储同步清掉该 id。关键发现：**归档的会话仍留在 `sessions.list` 的 ids 里**，只按 ids 判活会漏；改为 `alive = ids - workspaces.archivedSessionIds`（`dsh-api-workspace-controller` 快照字段），并同时订阅 workspaces 列表，归档当场就能剪掉标签。
+- ③ 四个标签全部失效（直接移走会话目录）→ 三栏与 `[0.5,0.3,0.2]` 宽度全保留，三格都渲染 `[data-mono-empty]` 空态，存储回写成空 `tabs:[]`。
+- 棘手的顺序问题：还原出来的死标签若先渲染一帧，`sessions.retain` 会抛 `unknown session` 并打 warning。`paintedWorkspace`（`src/client/index.js`）在**首帧前**就按当前列表剪一遍再交给 `PaneTree`，scan effect 随后提交到 store；这一改之后 ③ 的控制台才真的清净。
+- 边界：垃圾 JSON / `version:99` / 单子节点 split / `sizes:[0,-1]` → 都不白屏、控制台零异常，回落单栏（存储键被删掉后重来）；合法但只剩一个 leaf 的树保留该栏、死标签剪掉后显示空态。
+- 节流实测：连点 5 次分栏 → 50ms 时 0 次写入、80ms 仍 0、600ms 后恰好 1 次；改一次后立刻 reload（不等 200ms）→ 改动仍在（`pagehide` flush 生效）。
+- 已知限制：宽度只能靠预置 sizes 验证（T07 才有力拖动）；`pruneWorkspaceSessions` 只在 `phase==="ready"` 时跑，冷启动列表未就绪的那一帧仍可能短暂显示已失效标签（首帧已用列表快照再剪一次，实测未出现）。
 
 ---
 

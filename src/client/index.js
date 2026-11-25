@@ -26,9 +26,14 @@ function PanelIcon() {
   );
 }
 
-/** Pane ids only have to be unique within this page. */
+/** Pane ids only have to be unique within this page; restored ids are already taken. */
 let paneSeq = 0;
-const nextPaneId = () => "pane-" + ++paneSeq;
+const nextPaneId = () => {
+  const taken = new Set(Object.keys(workspaceGet()?.panes ?? {}));
+  let id;
+  do { id = "pane-" + ++paneSeq; } while (taken.has(id));
+  return id;
+};
 
 /**
  * The user's intent to sit in Mono — page-level on purpose: MonoRoot unmounts
@@ -186,6 +191,16 @@ function watchPanelIntent() {
   };
 }
 
+/** Sessions the host has archived: the layout treats them as gone. */
+function archivedSessionIds() {
+  const list = service("workspaces")?.list;
+  if (list === undefined || typeof list.getSnapshot !== "function") return new Set();
+  try {
+    const ids = list.getSnapshot()?.archivedSessionIds;
+    return new Set(Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : []);
+  } catch { return new Set(); }
+}
+
 let watching = false;
 function watchSessions(sessions, attempts = 0) {
   if (watching) return;
@@ -202,6 +217,17 @@ function watchSessions(sessions, attempts = 0) {
     try { snapshot = list.getSnapshot(); } catch { return; }
     const ids = Array.isArray(snapshot?.ids) ? snapshot.ids : [];
     const byId = snapshot?.byId ?? {};
+    // T06: stored tabs for sessions the host no longer has are dropped here.
+    // Only when the list is complete: while phase is 'pending' an empty `ids`
+    // means "not loaded yet", and pruning then would erase every tab on boot.
+    // Archived sessions stay in the session list (the host keeps their data and
+    // offers unarchive), so they are subtracted explicitly: a tab the sidebar
+    // no longer shows is a dead tab for this layout.
+    if (snapshot?.phase === "ready") {
+      const archived = archivedSessionIds();
+      const alive = new Set(ids.filter((id) => !archived.has(id)));
+      workspaceUpdate((previous) => pruneWorkspaceSessions(previous, alive) ?? previous);
+    }
     // ponytail: first positive mainView in list order covers the instant the
     // host holds two (retain new, then release old); the next scan settles it.
     const opened = ids.find((id) => (byId[id]?.retainedBy?.mainView ?? 0) > 0);
@@ -230,7 +256,37 @@ function watchSessions(sessions, attempts = 0) {
     watching = false;
     return;
   }
+  // Archiving changes the workspace snapshot (and usually the session list too);
+  // subscribing to both means an archive prunes even when ids stay put.
+  try { service("workspaces")?.list?.subscribe?.(scan); } catch (error) {
+    log("archive watch failed", String(error));
+  }
   scan(); // baseline: the current selection is not a new open
+}
+
+/**
+ * A valid stored layout wins over the fresh one. Runs during render like
+ * workspaceStart: the backup key is read once, because a non-null store
+ * short-circuits before restoreWorkspaceState is called.
+ */
+function bootWorkspace(listState) {
+  return workspaceGet()
+    ?? workspaceRestore(restoreWorkspaceState())
+    ?? workspaceStart(nextPaneId(), initialSessionId(listState));
+}
+
+/**
+ * The layout as it should paint. A restored tab for a session the host no longer
+ * has is left out of the very first render, before the scan effect commits the
+ * pruned store: painting it would ask the host to retain an unknown session and
+ * log a warning for a frame the user never keeps.
+ */
+function paintedWorkspace(layout, listState) {
+  if (listState?.phase !== "ready") return layout;
+  const archived = archivedSessionIds();
+  const ids = Array.isArray(listState.ids) ? listState.ids : [];
+  const alive = new Set(ids.filter((id) => !archived.has(id)));
+  return pruneWorkspaceSessions(layout, alive) ?? layout;
 }
 
 /** Session the first pane starts with: the host's last pick, else the newest. */
@@ -248,7 +304,8 @@ function MonoRoot(props) {
   // Page-level store: the host unmounts this panel whenever it reveals one of
   // its own, and the tabs have to survive that (state/workspace.js).
   const layout = react.useSyncExternalStore(workspaceSubscribe, workspaceGet, workspaceGet)
-    ?? workspaceStart(nextPaneId(), initialSessionId(listState));
+    ?? bootWorkspace(listState);
+  const painted = paintedWorkspace(layout, listState);
 
   react.useEffect(() => { watchSessions(service("sessions")); }, []);
 
@@ -258,7 +315,7 @@ function MonoRoot(props) {
   // root-level hold the pane's own retain is released before the remounted one
   // acquires, the native conversation briefly resolves no binding, and its input
   // shell throws. Ref-counting in session/reference.js makes this free.
-  const heldKey = Array.from(new Set(paneSessionIds(layout.panes))).sort().join(",");
+  const heldKey = Array.from(new Set(paneSessionIds(painted.panes))).sort().join(",");
   const heldRef = react.useRef(new Set());
   react.useEffect(() => {
     if (sessions === undefined || heldKey === "") return;
@@ -312,7 +369,7 @@ function MonoRoot(props) {
         onClick: exitToHost,
       }, "回到宿主视图")),
     h(PaneTree, {
-      tree: layout.tree,
+      tree: painted.tree,
       ids: listState?.ids,
       // A pick is an explicit choice, so it promotes. openTabInPane returns
       // early for a tab already in this pane (switching tabs must not promote a
@@ -322,7 +379,7 @@ function MonoRoot(props) {
         workspacePromoteSession(sessionId);
         workspaceOpenTab(paneId, sessionId, {});
       },
-      panes: layout.panes,
+      panes: painted.panes,
       byId: listState?.byId,
       activePaneId: layout.active,
       onActivate: workspaceSetActivePane,
@@ -346,8 +403,9 @@ const MONO_PLUGIN = {
     CTX = ctx;
     ensureStyle();
     // Page-level, not panel-level: it has to keep receiving panel switches while
-    // MonoRoot is unmounted.
+    // MonoRoot is unmounted, and a write on the way out must not be dropped.
     ctx.effect(watchPanelIntent);
+    ctx.effect(startWorkspacePersistence);
     // The \`children\` declaration is load-bearing: it is what makes the host
     // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
     // the panes render the "no SessionProvider" fallback. Cost: with a dead

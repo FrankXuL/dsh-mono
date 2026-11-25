@@ -112,6 +112,16 @@ function workspaceStart(paneId, sessionId) {
   return workspaceState;
 }
 
+/**
+ * Install a layout restored from storage before the first paint. Same contract
+ * as workspaceStart: render-time, no notify, and never replaces a live state.
+ */
+function workspaceRestore(state) {
+  if (workspaceState !== null || state === null || state === undefined) return workspaceState;
+  workspaceState = state;
+  return workspaceState;
+}
+
 /** Last Session the host showed (retained as mainView), if seen. */
 function workspaceHostSelection() { return hostSelection; }
 
