@@ -344,6 +344,13 @@ DSH_HOME=/tmp/mono-dsh dsh --profile cdp --no-open
 
 Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mono → 点侧栏会话：应弹回 Mono 且该会话是 preview 标签；选择器条数应与侧栏当前工作区一致。
 
+**审查（独立复验，2026-11-25，另一会话）**：真宿主 + 无头 Chrome CDP（`DSH_HOME=/tmp/t05home`，插件装进 **web** profile：`dsh plugin --profile web add link:…`；服务 `dsh web --no-open --port 61600`；Chrome `--headless=new --remote-debugging-port=9222`，视口 1680×1050）。全程零 console error/warning、零未捕获异常。注意：T04c 提交说明里的「CDP 被封死」只对当时那个沙箱成立，换到 web profile 后 CDP 完全可用。
+
+- **缺陷① 已修（实测）**：Mono → 点侧栏「插件」→ 点侧栏会话 → 停在插件面板（`mono:false`），不再被拽回；回 Mono 再点侧栏会话，弹回仍生效（`mono:true`，该会话成为 `*` preview 标签）。实文 `src/client/index.js:159`：`if (activePanel() !== null) { monoIntent = false; return; }`。
+- **缺陷② 已修（实测）**：pane1 `[15b146, e6151b*]` → 开选择器 → 点 `e6151b`（该行 `data-mono-picker-held="true"`）→ 变 `e6151b`（星号消失）、标签数不变、选择器自动关。实文 `src/client/index.js:314-325` 先 `workspacePromoteSession` 再 `workspaceOpenTab`。
+- **缺陷③ 契约级通过，端到端未跑**：本 profile 只有一个工作区，且「添加工作区」在无头环境弹不出可脚本驱动的目录选择器（原生 file input），第二个工作区建不出来。改核宿主契约：`workspaces.list.getSnapshot()` 真实形状 = `{ items, pinnedSessionIds, archivedSessionIds }`；`items[].sessionIds` 的真实使用点见 `@deepseek-ai/dsh-client-ui-workspace/src/client/navigation.ts`（`workspace.sessionIds.includes(id)`、`workspaces.items.find(item => item.sessionIds.includes(current))`），空会话规则同处。插件 `pickerScope`/`pickerIds`（`src/client/panes/SessionPicker.js:37-84`）读的正是这两个字段。实测选择器 3 行 = 侧栏 3 行，每行带 `.mono-picker-dir` 后缀（本 profile 显示 `default-workspace`），同名可区分。
+- **遗留**：跨工作区过滤只到契约级，要端到端复验需在真实桌面上建两个工作区各放一条会话，再看选择器是否只列当前那个。
+
 ---
 
 ### [x] T05 — 拖拽分栏
@@ -402,6 +409,21 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 避免误触发点击：`pointerdown` 只「上膛」，位移不足 5px 时 `endDrag` 直接返回、不碰任何状态，所以普通点击（激活标签、双击转正、中键关闭）一条不落；一旦真的开始拖，`pointerup` 后那个 `click` 由 window 捕获阶段 400ms 的守卫 `preventDefault + stopPropagation` 吃掉，不会落到落点下面的栏/标签/选择器上。拖拽也不读宿主的 `data-dockkit-*` / `data-sidebar-right-*`（feasibility-matrix #30）。
 
 **已知限制**：① 拖到自己这一栏的边上不放（同栏拖 = no-op），所以单栏布局没法用拖拽从自己身上分出新栏，仍走工具栏的 Split；这样避免误触把唯一一栏拆散。② 点击守卫窗口 400ms，拖完立刻点同一个位置的第一下会被吞。③ 指针事件的真实 DOM 行为（`elementFromPoint` 在真页面上的遮挡、覆盖层的 `pointer-events`）在无头环境里没有跑到，需按 T04c 的复验方式在真实宿主里点一次：拖标签到另一栏右半边应新建栏，拖回标签条应合并，拖起后按 Esc 应无变化。
+
+**审查（独立复验，2026-11-25，另一会话）**：真宿主 + 无头 Chrome CDP（环境同上一条 T04c 审查），用 `Input.dispatchMouseEvent` 发真实指针事件，**不是** `mono-probe.mjs` 的假环境。视口 1680×1050，全程零 console error/warning、零未捕获异常。已知限制③ 由此**销账**：指针真行为已在真页面跑通。
+
+四条过关标准逐条实测：
+
+1. **右半边 → 在右侧新建栏**：单栏 1384px 宽（x=288, y=42）拖标签到右 85% 处 → 三栏同排 `x=288/751/1215, w=457/457/457, y=42, h=913`（新栏取目标一半份额后与中间栏等分）；提示线为 x=1326.5 的 2px 竖线、半屏 wash。
+2. **下边缘 → 竖直新建栏**：pane1 `[36e7d1, 28c26a*]`、pane2 空 → 拖 `28c26a` 到 pane2 下半 → 树 `[pane-1(36e7d1), pane-2(空), pane-3(28c26a)]`，wash `left:983px top:498.5px w:689px h:456.5px` 正好是 pane2 下半屏；**preview 被转正**（无星号），源栏保住自己的标签。
+3. **拖回合并**：拖到目标栏的 `[data-mono-tabs]` 上（命中标签条即 `edge=null`）→ 栏数不变、两栏各得一个标签、目标栏成为活动栏、preview 转正。
+4. **Esc 取消**：拖到目标半屏后按 Escape 再松手 → 布局一字未变、`.mono-drop-wash` `display:none`、`body.mono-dragging` 已移除、preview 仍是 `*`（promote 在落点判定之后才执行，取消不转正）。
+
+其余实测（超出验收）：整栏迁移——源栏只剩一个标签时拖到别栏底边 → DOM 顺序变 `[pane-2(上), pane-1(下)]`，走的是 `movePane` 不是 `splitPane`，源栏标签不丢；拖到自己栏 = no-op（无提示、无变化，目标排除 `fromPaneId`）；点击守卫——把标签拖到「回到宿主视图」出口按钮上松手，**仍停在 Mono**（尾随 click 被 400ms 捕获阶段守卫吃掉，否则会误退出）；按住 `.mono-tab-close` 起手拖到别栏边缘松手 → 无新栏、无标签丢失（`beginTabDrag` 里 `closest(".mono-tab-close")` 直接 return）；位移 2px 后松手仍算点击（标签正常激活）；拖完 500ms 后再点同位置能正常激活（守卫已注销）。
+
+实现与行为一致（已通读）：`src/client/panes/Drag.js`（185 行）`DRAG_THRESHOLD=5`/`CLICK_GUARD_MS=400`、`dropTargetAt` 用 `elementFromPoint` → `closest("[data-mono-pane]")`、`endDrag` 顺序 `!active return → guardClick → target null return → workspacePromoteSession → workspaceMoveTab(from, id, to, edge, nextPaneId())`；`src/client/layout/tree.js` 的 `movePane` 对未知 id / 非法 edge / 同栏一律返回原树（**不返回 null**，所以不会把 tree 置空），同组同轴走 `reorderInGroup` 保尺寸。
+
+**待补（低）**：`workspaceMoveTab`（`src/client/state/workspace.js:205-243`）三条分支没有任何可运行自检——`workspaceSelfCheck`（同文件 245 行起）只覆盖 `paneOf`/`openTabInPane`/`promoteTabAt`/`closeTabAt`，移动逻辑全靠 CDP 手测。依仓内「非平凡逻辑留一个可运行检查」的约定，应在 `workspaceSelfCheck` 补三条：合并（源栏清空即塌缩）、整栏迁移（同轴同组保尺寸）、单标签外拖（新建栏只装那一个标签）。
 
 ---
 
