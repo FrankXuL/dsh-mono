@@ -7,3 +7,4 @@ node_modules/
 # 取证缓存：从 DSH 装包里抓出来的 README / 源码摘录，可由 tools/ 下的脚本重新生成。
 # 调研结论本身在 research/*.md 里，这里只是复核行号用的副本。
 .scratch/monocode-ui-parity/research/_dump/
+.dsh-super-code/
