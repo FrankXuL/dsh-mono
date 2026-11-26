@@ -476,7 +476,7 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 ## 阶段 2：完整手势（L）
 
-### [ ] T07 — sash 拖动改比例
+### [x] T07 — sash 拖动改比例
 
 **目标**：栏之间的分隔条可拖动改宽度，带最小尺寸与取消。
 
@@ -510,6 +510,30 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 完成后：报告最小尺寸的钳制算法、以及拖动预览与提交的分离方式。
 ```
+
+**审查记录** 2026-11-26（独立会话，真机 CDP，一次性 profile `/tmp/t07rev` + `dsh web --no-open --port 61602` + headless Chrome `--remote-debugging-port=9224`，视口 1680×1050，`Input.dispatchMouseEvent` 发真实指针事件）
+
+提交 `5d29647`（6 文件 +425/−7，`client.js` 12 chunks / 124686 bytes）。静态：`npm run build` 幂等、`node --check client.js`、`node src/client/layout/tree.js` 19 checks、`node src/client/state/workspace.js`、`node src/client/persist/index.js` 全绿；`git status` 干净。
+
+| 过关项 | 独立复验结果 |
+|---|---|
+| 拖第三块不动 | 三栏 457/457/457，sash `row:0` +100px → 556/358/457，第三栏 457 不变；提交 `sizes [0.405588, 0.261079, 0.333333]` |
+| 8% 钳制不越界 | 继续拖到 +2000px → 805/110/457，110px 即 1372 的 8%（`0.07999999999999996`），无过冲 |
+| Esc 还原 | 拖到 −120px（预览 110/805/457）后 Esc → 210/705/457，存储**逐字节相同**，写入 0 次，`body` class 已清 |
+| 松手后持久化 | 松手后 `Page.reload` 重进 Mono → 210/705/457 与刷新前一致 |
+| 嵌套只改被拖层 | 整栏拖到 pane-3 下半 → 外层 row `[pane-2, column(pane-3,pane-1)]`；拖内层 column sash +120px → 内层 `[0.5,0.5] → [0.631435,0.368565]`（120/913），外层 `[0.606389,0.393611]` **逐字未动** |
+| 零异常 | 四段探针全程 `errs []` `exc []`（含 boot、进 Mono、三次分栏、六次拖动、Esc、reload） |
+
+超出验收的实测：拖动中 `localStorage` 写入 0 次、松手 1 次（200ms 尾沿合并到一次提交，T06 不被逐帧刷写）；只点不拖不写（写入 0、几何不变）；单帧拖动（press→一次 move→立刻 release，不等 rAF）仍以最后位置提交（+60px → 59px）；连拖三次几何单调、class 每次清干净；松手落在栏体上不触发激活、无文本选中、无 `.mono-drop-wash/.mono-drop-line` 残留；拖动中切到「插件」面板（MonoRoot 卸载）→ `mono-sash-dragging` 被摘掉、后续指针移动与松手都不写存储（`PaneTree` 卸载 effect 起效）；sash 计算样式 `cursor: col-resize / row-resize`、`touch-action: none`。
+
+实现核对：`src/client/panes/PaneTree.js:112-141` `beginSashDrag`（`pointerId` 绑定、`setPointerCapture` 失败也不影响 window 监听）；`:28-40` `flushSashFrame` 取 `drag.splitEl` 自身 rect 沿轴长度做分母（嵌套组按自身量，不是整树）；`:43-50` 每帧只保留最新坐标；`:78-105` `endSashDrag(commit)` 先 flush 再 `workspaceSetSplitSizes`，cancel 时把预览置回；`:143-153` 卸载 effect 按 `splitId` 收尾；`src/client/layout/tree.js:334-341` `sashDelta`（非法输入得 0）、`:363-375` `setSplitSizes`（同值返回同一棵树）。
+
+三条记账（都不必修）：
+1. **像素有 0.9% 缩水**：分母用 split 的整段 rect（含 sash 与栏间隙 12px），三栏时 100px 指针位移只让邻块变 99px（1372/1384）。观感无感，要 1:1 就得先减掉 sash 总宽——不值得，留作已知。
+2. **`data-mono-sash` 只到 `dir:index`**：同一父下同轴嵌套会出现重复标签（提交说明已记）。实测构造不出同轴嵌套（`splitAt` 同轴时插兄弟、`placeBeside` 同轴时摊平 sizes），身份由闭包承担，无缺陷。
+3. **`role="separator"` 无 `tabindex`/`aria-valuenow`**：键盘缩放按 YAGNI 未做；读屏只知「这是分隔条」，不知位置。等 T10 快捷键那单元一起看要不要补。
+
+结论：T07 通过，无必修缺陷。
 
 ---
 
