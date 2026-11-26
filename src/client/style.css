@@ -64,6 +64,7 @@
   background: var(--dsh-border, #ddd);
   opacity: 0.45;
   border-radius: 3px;
+  touch-action: none;
 }
 
 .mono-sash:hover {
@@ -76,6 +77,19 @@
 
 .mono-split[data-mono-dir="column"] > .mono-sash {
   cursor: row-resize;
+}
+
+/* A drag must not select the host's transcript text under the pointer. */
+body.mono-sash-dragging {
+  cursor: grabbing;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+body.mono-sash-dragging * {
+  cursor: grabbing !important;
+  -webkit-user-select: none !important;
+  user-select: none !important;
 }
 
 .mono-pane {

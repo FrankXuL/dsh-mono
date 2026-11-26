@@ -331,6 +331,17 @@ const neighborPaneId = (tree, paneId, dir) => {
 };
 
 /**
+ * Pointer movement along one split's axis -> normalized group units. The
+ * caller passes the split's own rect length, so a nested group is measured
+ * against itself and not against the whole tree.
+ */
+const sashDelta = (movedPx, groupPx) => (
+  Number.isFinite(movedPx) && Number.isFinite(groupPx) && groupPx > 0
+    ? movedPx / groupPx
+    : 0
+);
+
+/**
  * New sizes for one split after dragging the sash at `index` by `delta`
  * (normalized group units; positive grows the left/top neighbour). Both
  * neighbours stay at or above 8% of the group, or half the pair when the pair
@@ -347,6 +358,21 @@ const sizesAtBoundary = (tree, splitId, index, delta) => {
   sizes[index] = Math.min(pair - min, Math.max(min, sizes[index] + step));
   sizes[index + 1] = pair - sizes[index];
   return sizes;
+};
+
+/**
+ * Replace one split's sizes (a sash commit). Returns the same tree when nothing
+ * would change, and null on an unknown split or malformed sizes — the caller
+ * then keeps its previous state object, so an abandoned drag writes nothing.
+ */
+const setSplitSizes = (tree, splitId, sizes) => {
+  if (typeof splitId !== "string" || splitId === "") return null;
+  if (!Array.isArray(sizes) || !sizes.every((size) => Number.isFinite(size) && size > 0)) return null;
+  const split = findSplit(tree, splitId);
+  if (split === null || sizes.length !== split.sizes.length) return null;
+  const next = normalizeSizes(sizes);
+  if (next.every((size, index) => Math.abs(size - split.sizes[index]) <= 1e-9)) return tree;
+  return replaceNode(tree, split, { ...split, sizes: next });
 };
 
 // ---- self-check ------------------------------------------------------------
@@ -513,6 +539,34 @@ const runSelfChecks = (assert) => {
     closeSizes(sizesAtBoundary(custom, custom.id, 1, -1), [0.6, 0.08, 0.32], "second");
     const thin = makeSplit("row", [leaf("a"), leaf("b"), leaf("c")], [0.93, 0.05, 0.02]);
     closeSizes(sizesAtBoundary(thin, thin.id, 1, -1), [0.93, 0.035, 0.035], "thin pair");
+  });
+
+  test("sash delta converts pixels to group units, then the floor holds", () => {
+    close(sashDelta(100, 800), 0.125, "pixels over group length");
+    close(sashDelta(100, 0), 0, "no length");
+    close(sashDelta(Number.NaN, 800), 0, "no pointer delta");
+    const custom = makeSplit("row", [leaf("a"), leaf("b"), leaf("c")], [0.5, 0.3, 0.2]);
+    // 300px over a 1000px group wants +0.3 on the first pane; 8% lifts the
+    // second out of the floor and the third keeps its share.
+    closeSizes(sizesAtBoundary(custom, custom.id, 0, sashDelta(300, 1000)), [0.72, 0.08, 0.2], "drag");
+  });
+
+  test("a sash commit replaces one split's sizes and only that one", () => {
+    const tree = splitPane(leaf("a"), "a", "column", "c");
+    const nested = splitPane(tree, "a", "row", "b");
+    const row = nested.children[0];
+    const next = setSplitSizes(nested, row.id, [0.7, 0.3]);
+    closeSizes(next.children[0].sizes, [0.7, 0.3], "committed row");
+    closeSizes(next.sizes, [0.5, 0.5], "outer untouched");
+    // Same sizes -> same tree (the store can skip the write).
+    const same = setSplitSizes(next, row.id, [0.7, 0.3]);
+    assert.equal(same, next);
+    // Garbage -> null, never a half-written tree.
+    assert.equal(setSplitSizes(next, row.id, [0, 1]), null);
+    assert.equal(setSplitSizes(next, row.id, [0.5]), null);
+    assert.equal(setSplitSizes(next, row.id, "nope"), null);
+    assert.equal(setSplitSizes(next, "missing", [0.5, 0.5]), null);
+    assert.equal(setSplitSizes(next, row.id, [0.3, 0.7]).children[0].sizes[0], 0.3);
   });
 
   test("neighborPaneId walks geometry in a flat group", () => {

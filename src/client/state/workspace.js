@@ -190,6 +190,19 @@ function workspaceSetActivePane(paneId) {
   workspaceUpdate((previous) => (previous.active === paneId ? previous : { ...previous, active: paneId }));
 }
 
+/**
+ * Sash commit (T07): replace one split's sizes. The drag preview never gets
+ * here — only the released sizes do — so T06 persists once per gesture.
+ * Unknown splits and malformed sizes are no-ops, and an unchanged result keeps
+ * the previous state object (no listener churn, no write).
+ */
+function workspaceSetSplitSizes(splitId, sizes) {
+  workspaceUpdate((previous) => {
+    const tree = setSplitSizes(previous.tree, splitId, sizes);
+    return tree === null || tree === previous.tree ? previous : { ...previous, tree };
+  });
+}
+
 /** Split: the new pane opens empty — it must not copy the neighbour's tabs. */
 function workspaceSplit(paneId, newPaneId) {
   workspaceUpdate((previous) => ({

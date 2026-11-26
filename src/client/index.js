@@ -406,6 +406,9 @@ const MONO_PLUGIN = {
     // MonoRoot is unmounted, and a write on the way out must not be dropped.
     ctx.effect(watchPanelIntent);
     ctx.effect(startWorkspacePersistence);
+    // A sash drag holds window listeners, a rAF and a pointer capture; plugin
+    // teardown must release all three, not just a panel unmount.
+    ctx.effect(() => () => cancelSashDrag());
     // The \`children\` declaration is load-bearing: it is what makes the host
     // hand this panel \`SessionProvider\` and \`renderFactorySlot\`. Drop it and
     // the panes render the "no SessionProvider" fallback. Cost: with a dead
