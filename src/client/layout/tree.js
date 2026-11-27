@@ -196,6 +196,21 @@ const extractLeaf = (node, paneId) => {
 const EDGE_AXIS = { left: "row", right: "row", top: "column", bottom: "column" };
 const EDGE_BEFORE = { left: true, right: false, top: true, bottom: false };
 
+/**
+ * T08: how far (pixels, sign included) a split's child should start offset from
+ * its own edge. A child at the end of its axis arrives from that edge, every
+ * other child from the start — the pane a split or drop just created is always
+ * appended, so the slide points back at where it came from.
+ */
+const enterOffset = (dir, index, count, distance = 16) => {
+  if (dir !== "row" && dir !== "column") return { x: 0, y: 0 };
+  if (!Number.isFinite(index) || !Number.isFinite(count) || count < 2) return { x: 0, y: 0 };
+  const sign = index >= count - 1 ? 1 : -1;
+  return dir === "row"
+    ? { x: sign * distance, y: 0 }
+    : { x: 0, y: sign * distance };
+};
+
 /** Same-group reorder: carry each pane's size with it, never re-divide. */
 const reorderInGroup = (tree, parent, fromIndex, toIndex, before) => {
   let at = before ? toIndex : toIndex + 1;
@@ -567,6 +582,15 @@ const runSelfChecks = (assert) => {
     assert.equal(setSplitSizes(next, row.id, "nope"), null);
     assert.equal(setSplitSizes(next, "missing", [0.5, 0.5]), null);
     assert.equal(setSplitSizes(next, row.id, [0.3, 0.7]).children[0].sizes[0], 0.3);
+  });
+
+  test("enterOffset points back at the edge a new child came from", () => {
+    assert.deepEqual(enterOffset("row", 1, 2), { x: 16, y: 0 }, "row, appended");
+    assert.deepEqual(enterOffset("row", 0, 2), { x: -16, y: 0 }, "row, prepended");
+    assert.deepEqual(enterOffset("column", 2, 3), { x: 0, y: 16 }, "column, appended");
+    assert.deepEqual(enterOffset("column", 0, 3), { x: 0, y: -16 }, "column, prepended");
+    assert.deepEqual(enterOffset("row", 0, 1), { x: 0, y: 0 }, "single child does not slide");
+    assert.deepEqual(enterOffset("diagonal", 1, 2), { x: 0, y: 0 }, "unknown axis does not slide");
   });
 
   test("neighborPaneId walks geometry in a flat group", () => {

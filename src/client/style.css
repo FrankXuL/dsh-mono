@@ -55,6 +55,29 @@
   flex-shrink: 1;
   min-width: 0;
   min-height: 0;
+  /* T08: a split changes every share at once; easing the shares makes the
+     neighbours follow the new pane instead of jumping. Kept off during a sash
+     drag (below) so the pointer stays 1:1. */
+  transition: flex-grow 150ms cubic-bezier(0.2, 0, 0.1, 1);
+}
+
+/* T08: the pane a split created slides in from the edge it came from. */
+@keyframes mono-pane-slide-in {
+  from {
+    transform: translate3d(var(--mono-enter-x, 0px), var(--mono-enter-y, 0px), 0);
+    opacity: 0.35;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.mono-pane-enter {
+  position: relative;
+  z-index: 1;
+  will-change: transform, opacity;
+  animation: mono-pane-slide-in 150ms cubic-bezier(0.2, 0, 0.1, 1);
 }
 
 /* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */
@@ -90,6 +113,20 @@ body.mono-sash-dragging * {
   cursor: grabbing !important;
   -webkit-user-select: none !important;
   user-select: none !important;
+}
+
+/* A sash drag must stay 1:1 under the pointer: no easing on the shares. */
+body.mono-sash-dragging .mono-cell {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mono-cell {
+    transition: none;
+  }
+  .mono-pane-enter {
+    animation: none;
+  }
 }
 
 .mono-pane {

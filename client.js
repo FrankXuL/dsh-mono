@@ -228,6 +228,21 @@ window.__ModuleLoader__.load({
     const EDGE_AXIS = { left: "row", right: "row", top: "column", bottom: "column" };
     const EDGE_BEFORE = { left: true, right: false, top: true, bottom: false };
 
+    /**
+     * T08: how far (pixels, sign included) a split's child should start offset from
+     * its own edge. A child at the end of its axis arrives from that edge, every
+     * other child from the start — the pane a split or drop just created is always
+     * appended, so the slide points back at where it came from.
+     */
+    const enterOffset = (dir, index, count, distance = 16) => {
+      if (dir !== "row" && dir !== "column") return { x: 0, y: 0 };
+      if (!Number.isFinite(index) || !Number.isFinite(count) || count < 2) return { x: 0, y: 0 };
+      const sign = index >= count - 1 ? 1 : -1;
+      return dir === "row"
+        ? { x: sign * distance, y: 0 }
+        : { x: 0, y: sign * distance };
+    };
+
     /** Same-group reorder: carry each pane's size with it, never re-divide. */
     const reorderInGroup = (tree, parent, fromIndex, toIndex, before) => {
       let at = before ? toIndex : toIndex + 1;
@@ -599,6 +614,15 @@ window.__ModuleLoader__.load({
         assert.equal(setSplitSizes(next, row.id, "nope"), null);
         assert.equal(setSplitSizes(next, "missing", [0.5, 0.5]), null);
         assert.equal(setSplitSizes(next, row.id, [0.3, 0.7]).children[0].sizes[0], 0.3);
+      });
+
+      test("enterOffset points back at the edge a new child came from", () => {
+        assert.deepEqual(enterOffset("row", 1, 2), { x: 16, y: 0 }, "row, appended");
+        assert.deepEqual(enterOffset("row", 0, 2), { x: -16, y: 0 }, "row, prepended");
+        assert.deepEqual(enterOffset("column", 2, 3), { x: 0, y: 16 }, "column, appended");
+        assert.deepEqual(enterOffset("column", 0, 3), { x: 0, y: -16 }, "column, prepended");
+        assert.deepEqual(enterOffset("row", 0, 1), { x: 0, y: 0 }, "single child does not slide");
+        assert.deepEqual(enterOffset("diagonal", 1, 2), { x: 0, y: 0 }, "unknown axis does not slide");
       });
 
       test("neighborPaneId walks geometry in a flat group", () => {
@@ -1752,6 +1776,67 @@ window.__ModuleLoader__.load({
       window.addEventListener("blur", sashBlur, true);
     }
 
+    // ---- pane entry: slide in, then mount the heavy body -----------------------
+    // T08. A pane a split just created slides in from its own edge while the split's
+    // shares ease (CSS, .mono-cell); its body — the host conversation — mounts only
+    // after the slide, so a large session cannot stall the animation. Reduced motion
+    // skips both: no offset, body mounted immediately.
+    const ENTER_MS = 150; // keep in step with the .mono-pane-enter duration in style.css
+
+    const prefersReducedMotion = () => (
+      typeof window.matchMedia === "function"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches === true
+    );
+
+    function PaneLeaf(props) {
+      const { paneId, enter } = props;
+      const active = props.activePaneId === paneId;
+      // panes can still hold the T03 shape; paneOf upgrades it on read.
+      const pane = paneOf(props.panes, paneId);
+      const tab = pane.tabs[pane.activeIndex];
+      // Read once: adding a sibling must not restart a pane's entry animation.
+      const [entering, setEntering] = react.useState(() => (
+        enter !== undefined && (enter.x !== 0 || enter.y !== 0) && !prefersReducedMotion()
+      ));
+      react.useEffect(() => {
+        if (!entering) return undefined;
+        const timer = window.setTimeout(() => setEntering(false), ENTER_MS);
+        return () => window.clearTimeout(timer);
+      }, [entering]);
+      return h("div", {
+        className: entering ? "mono-pane mono-pane-enter" + (active ? " mono-pane-active" : "")
+          : active ? "mono-pane mono-pane-active" : "mono-pane",
+        "data-mono-pane": paneId,
+        style: entering ? { "--mono-enter-x": enter.x + "px", "--mono-enter-y": enter.y + "px" } : undefined,
+        onMouseDown: () => {
+          if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
+        },
+      },
+        h(TabStrip, {
+          paneId,
+          pane,
+          byId: props.byId,
+          ids: props.ids,
+          onPickSession: props.onPickSession,
+          onActivateTab: props.onActivateTab,
+          onCloseTab: props.onCloseTab,
+          onPromoteTab: props.onPromoteTab,
+          onOpenSession: props.onOpenSession,
+        }),
+        entering ? null : tab === undefined
+          ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
+          : h(Pane, {
+            // key: switching tabs must remount the native conversation, otherwise
+            // the SessionProvider keeps the old session's scope.
+            key: tab.sessionId,
+            sessionId: tab.sessionId,
+            sessions: props.sessions,
+            renderSlot: props.renderSlot,
+            renderFactorySlot: props.renderFactorySlot,
+            SessionProvider: props.SessionProvider,
+          }));
+    }
+
     function PaneNode(props) {
       const { node } = props;
       // Preview sizes are local to this split; the committed tree is untouched
@@ -1765,43 +1850,7 @@ window.__ModuleLoader__.load({
       }, [splitId]);
       if (node === null || node === undefined) return h("div", { className: "mono-empty" }, "no layout");
 
-      if (node.type === "leaf") {
-        const paneId = node.paneId;
-        const active = props.activePaneId === paneId;
-        // panes can still hold the T03 shape; paneOf upgrades it on read.
-        const pane = paneOf(props.panes, paneId);
-        const tab = pane.tabs[pane.activeIndex];
-        return h("div", {
-          className: active ? "mono-pane mono-pane-active" : "mono-pane",
-          "data-mono-pane": paneId,
-          onMouseDown: () => {
-            if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
-          },
-        },
-          h(TabStrip, {
-            paneId,
-            pane,
-            byId: props.byId,
-            ids: props.ids,
-            onPickSession: props.onPickSession,
-            onActivateTab: props.onActivateTab,
-            onCloseTab: props.onCloseTab,
-            onPromoteTab: props.onPromoteTab,
-            onOpenSession: props.onOpenSession,
-          }),
-          tab === undefined
-            ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
-            : h(Pane, {
-              // key: switching tabs must remount the native conversation, otherwise
-              // the SessionProvider keeps the old session's scope.
-              key: tab.sessionId,
-              sessionId: tab.sessionId,
-              sessions: props.sessions,
-              renderSlot: props.renderSlot,
-              renderFactorySlot: props.renderFactorySlot,
-              SessionProvider: props.SessionProvider,
-            }));
-      }
+      if (node.type === "leaf") return h(PaneLeaf, { ...props, paneId: node.paneId });
 
       const count = node.children.length;
       // Sizes come normalized from the tree layer; fall back to an even split so a
@@ -1816,7 +1865,7 @@ window.__ModuleLoader__.load({
           key: "cell-" + index,
           className: "mono-cell",
           style: { flexGrow: sizes[index] },
-        }, h(PaneNode, { ...props, node: child })));
+        }, h(PaneNode, { ...props, node: child, enter: enterOffset(node.dir, index, count) })));
         if (index < count - 1) {
           // Sash size is fixed in flex-basis, so the shares stay the only variable.
           cells.push(h("div", {
@@ -2172,7 +2221,7 @@ window.__ModuleLoader__.load({
     }
 
     /** CSS text, inlined from src/client/style.css. */
-    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n  touch-action: none;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n/* A drag must not select the host's transcript text under the pointer. */\nbody.mono-sash-dragging {\n  cursor: grabbing;\n  -webkit-user-select: none;\n  user-select: none;\n}\n\nbody.mono-sash-dragging * {\n  cursor: grabbing !important;\n  -webkit-user-select: none !important;\n  user-select: none !important;\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n/* While a tab is in flight: no text selection, and the whole window shows the\n   grab cursor even when the pointer is over another pane's content. */\nbody.mono-dragging {\n  user-select: none;\n  cursor: grabbing;\n}\n\nbody.mono-dragging .mono-tab {\n  cursor: grabbing;\n}\n\n/* Drop hint: fixed overlays (never part of the flex layout), one wash for the\n   half the new pane will occupy, one 2px accent line on the split itself. */\n.mono-drop-wash {\n  position: fixed;\n  z-index: 70;\n  pointer-events: none;\n  background: var(--dsh-accent-wash, rgba(106, 141, 255, 0.14));\n  border-radius: 4px;\n}\n\n.mono-drop-line {\n  position: fixed;\n  z-index: 71;\n  pointer-events: none;\n  background: var(--dsh-accent, #6a8dff);\n  border-radius: 1px;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
+    const MONO_STYLE_TEXT = ".mono-root {\n  display: flex;\n  flex-direction: column;\n  height: 100%;\n  min-height: 0;\n  padding: 8px;\n  gap: 8px;\n  box-sizing: border-box;\n}\n\n.mono-toolbar {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.mono-tool-btn {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 26px;\n  height: 26px;\n  padding: 0;\n  font: 16px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-tool-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n.mono-tree {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n/* Same box model in both axes: children flex-grow by their share of sizes. */\n.mono-split {\n  display: flex;\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-cell {\n  display: flex;\n  flex-basis: 0;\n  flex-shrink: 1;\n  min-width: 0;\n  min-height: 0;\n  /* T08: a split changes every share at once; easing the shares makes the\n     neighbours follow the new pane instead of jumping. Kept off during a sash\n     drag (below) so the pointer stays 1:1. */\n  transition: flex-grow 150ms cubic-bezier(0.2, 0, 0.1, 1);\n}\n\n/* T08: the pane a split created slides in from the edge it came from. */\n@keyframes mono-pane-slide-in {\n  from {\n    transform: translate3d(var(--mono-enter-x, 0px), var(--mono-enter-y, 0px), 0);\n    opacity: 0.35;\n  }\n  to {\n    transform: none;\n    opacity: 1;\n  }\n}\n\n.mono-pane-enter {\n  position: relative;\n  z-index: 1;\n  will-change: transform, opacity;\n  animation: mono-pane-slide-in 150ms cubic-bezier(0.2, 0, 0.1, 1);\n}\n\n/* Visible now, draggable in T07: fixed flex-basis keeps the shares exact. */\n.mono-sash {\n  flex: 0 0 6px;\n  align-self: stretch;\n  background: var(--dsh-border, #ddd);\n  opacity: 0.45;\n  border-radius: 3px;\n  touch-action: none;\n}\n\n.mono-sash:hover {\n  opacity: 0.8;\n}\n\n.mono-split[data-mono-dir=\"row\"] > .mono-sash {\n  cursor: col-resize;\n}\n\n.mono-split[data-mono-dir=\"column\"] > .mono-sash {\n  cursor: row-resize;\n}\n\n/* A drag must not select the host's transcript text under the pointer. */\nbody.mono-sash-dragging {\n  cursor: grabbing;\n  -webkit-user-select: none;\n  user-select: none;\n}\n\nbody.mono-sash-dragging * {\n  cursor: grabbing !important;\n  -webkit-user-select: none !important;\n  user-select: none !important;\n}\n\n/* A sash drag must stay 1:1 under the pointer: no easing on the shares. */\nbody.mono-sash-dragging .mono-cell {\n  transition: none;\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .mono-cell {\n    transition: none;\n  }\n  .mono-pane-enter {\n    animation: none;\n  }\n}\n\n.mono-pane {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  overflow: hidden;\n}\n\n.mono-pane-active {\n  border-color: var(--dsh-accent, #6a8dff);\n}\n\n.mono-pane-body {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n  position: relative;\n}\n\n.mono-pane-head {\n  flex: none;\n  min-width: 0;\n}\n\n/* The host content root is height:100%, so give it a definite flex parent. */\n.mono-pane-content {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-pane-content > * {\n  flex: 1 1 0;\n  min-width: 0;\n  min-height: 0;\n}\n\n.mono-empty {\n  padding: 12px;\n  font: 12px ui-monospace, monospace;\n  opacity: 0.6;\n}\n\n/* ---- tab strip ------------------------------------------------------------ */\n.mono-tabs {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 2px;\n  padding: 3px 4px;\n  overflow-x: auto;\n  scrollbar-width: none;\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n}\n\n.mono-tabs::-webkit-scrollbar {\n  display: none;\n}\n\n.mono-tab {\n  display: flex;\n  flex: 0 1 auto;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n  max-width: 220px;\n  padding: 2px 3px 2px 8px;\n  font: 12px/1.6 ui-monospace, monospace;\n  border: 1px solid transparent;\n  border-radius: 6px;\n  cursor: pointer;\n  opacity: 0.7;\n}\n\n.mono-tab:hover {\n  background: rgba(127, 127, 127, 0.12);\n  opacity: 1;\n}\n\n.mono-tab-active {\n  background: rgba(127, 127, 127, 0.16);\n  border-color: var(--dsh-border, #ddd);\n  opacity: 1;\n}\n\n.mono-tab-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* preview: transient tab, replaced by the next session opened in this pane. */\n.mono-tab-preview .mono-tab-title {\n  font-style: italic;\n}\n\n/* While a tab is in flight: no text selection, and the whole window shows the\n   grab cursor even when the pointer is over another pane's content. */\nbody.mono-dragging {\n  user-select: none;\n  cursor: grabbing;\n}\n\nbody.mono-dragging .mono-tab {\n  cursor: grabbing;\n}\n\n/* Drop hint: fixed overlays (never part of the flex layout), one wash for the\n   half the new pane will occupy, one 2px accent line on the split itself. */\n.mono-drop-wash {\n  position: fixed;\n  z-index: 70;\n  pointer-events: none;\n  background: var(--dsh-accent-wash, rgba(106, 141, 255, 0.14));\n  border-radius: 4px;\n}\n\n.mono-drop-line {\n  position: fixed;\n  z-index: 71;\n  pointer-events: none;\n  background: var(--dsh-accent, #6a8dff);\n  border-radius: 1px;\n}\n\n.mono-tab-close,\n.mono-tab-add {\n  display: inline-flex;\n  flex: none;\n  align-items: center;\n  justify-content: center;\n  width: 16px;\n  height: 16px;\n  padding: 0;\n  font: 12px/1 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 0;\n  border-radius: 4px;\n  cursor: pointer;\n  opacity: 0.6;\n}\n\n.mono-tab-close:hover,\n.mono-tab-add:hover {\n  background: rgba(127, 127, 127, 0.24);\n  opacity: 1;\n}\n\n.mono-tab-add {\n  width: 20px;\n  height: 20px;\n  font-size: 14px;\n}\n\n/* Empty pane: the tab strip stays, the pane shows where to start. */\n.mono-pane-empty {\n  display: flex;\n  flex: 1 1 0;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 10px;\n  min-height: 0;\n}\n\n.mono-pane-empty-title {\n  font: 12px ui-monospace, monospace;\n  opacity: 0.55;\n}\n\n.mono-pane-empty-btn {\n  padding: 4px 12px;\n  font: 12px/1.4 ui-monospace, monospace;\n  color: inherit;\n  background: transparent;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-pane-empty-btn:hover {\n  background: rgba(127, 127, 127, 0.12);\n}\n\n/* ---- in-pane session picker ----------------------------------------------- */\n/* This wrapper exists only to anchor the popover: .mono-tabs scrolls, and a\n   scrolling box clips absolutely positioned children. */\n.mono-tabstrip {\n  position: relative;\n  display: flex;\n  flex: none;\n  flex-direction: column;\n}\n\n.mono-picker {\n  position: absolute;\n  top: calc(100% + 4px);\n  left: 4px;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  min-width: 200px;\n  max-width: 300px;\n  max-height: 320px;\n  overflow-y: auto;\n  padding: 6px;\n  font: 12px/1.6 ui-monospace, monospace;\n  /* System colors follow the host's color-scheme; no theme token needed. */\n  color: CanvasText;\n  background: Canvas;\n  border: 1px solid var(--dsh-border, #ddd);\n  border-radius: 8px;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);\n}\n\n.mono-picker-new,\n.mono-picker-item {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  padding: 4px 8px;\n  font: inherit;\n  color: inherit;\n  text-align: left;\n  background: transparent;\n  border: 0;\n  border-radius: 6px;\n  cursor: pointer;\n}\n\n.mono-picker-new {\n  border-bottom: 1px solid var(--dsh-border, #ddd);\n  border-radius: 6px 6px 0 0;\n}\n\n.mono-picker-new:hover,\n.mono-picker-item:hover {\n  background: rgba(127, 127, 127, 0.16);\n}\n\n.mono-picker-head {\n  padding: 6px 8px 2px;\n  font-size: 11px;\n  opacity: 0.6;\n}\n\n.mono-picker-title {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n/* Several sessions can share a title (tmp, tmp…): the cwd basename is how the\n   host's own sidebar tells them apart. */\n.mono-picker-dir {\n  flex: none;\n  font-size: 11px;\n  opacity: 0.5;\n}\n\n/* Already in this pane: marked, still clickable (opening it only focuses it). */\n.mono-picker-item-held {\n  opacity: 0.7;\n}\n\n.mono-picker-check {\n  margin-left: auto;\n  opacity: 0.9;\n}\n\n.mono-picker-empty {\n  padding: 6px 8px;\n  opacity: 0.55;\n}\n\n/* The way back to the host's own view; without it the bounce traps. */\n.mono-tool-exit {\n  width: auto;\n  margin-left: auto;\n  padding: 0 10px;\n  font-family: inherit;\n  font-size: 12px;\n}\n";
 
     // ---- plugin root -----------------------------------------------------------
     /** Services resolve lazily: cordis may materialise them after apply() ran. */

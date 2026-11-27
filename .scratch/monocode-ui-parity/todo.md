@@ -537,7 +537,7 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 ---
 
-### [ ] T08 — 栏进入/退出滑入动画
+### [x] T08 — 栏进入滑入动画（退出滑出留给 T09）
 
 **目标**：分栏时有方向感，不明显卡顿。
 
@@ -570,6 +570,26 @@ Mono → 点「插件」→ 点侧栏会话：应停在插件面板；再回 Mon
 
 完成后：报告方向推导算法、deferBody 的触发时机、以及你如何测量帧率。
 ```
+
+**完成** 2026-11-27
+
+产物：`src/client/layout/tree.js` 新增 `enterOffset(dir, index, count, distance = 16)`（末端子块 +16px、其余 −16px；单子块与未知轴返回 `{x:0,y:0}`，自检 20 checks 里新增一条）；`src/client/panes/PaneTree.js` 抽出 `PaneLeaf` 组件，`ENTER_MS = 150` 与 CSS 同步、`prefersReducedMotion()` 读 `window.matchMedia("(prefers-reduced-motion: reduce)")`、`entering` 用 `react.useState(() => …)` 只读一次（加兄弟不会重放动画）、`entering ? null : 会话体` 就是 deferBody；`src/client/style.css` `.mono-cell { transition: flex-grow 150ms cubic-bezier(0.2,0,0.1,1) }`、`@keyframes mono-pane-slide-in`（`translate3d(var(--mono-enter-x), var(--mono-enter-y), 0)` + opacity 0.35→1）、`body.mono-sash-dragging .mono-cell { transition: none }`、`@media (prefers-reduced-motion: reduce)` 关掉 transition 与 animation。`client.js` 128472 bytes / 12 chunks。
+
+实测（一次性 profile `/tmp/t08rev`，`dsh web --no-open --port 61603`，headless Chrome `--remote-debugging-port=9225`，1680×1050，rAF 逐帧采样）：
+- **方向与滑入**：6 栏 row 分栏，新栏 `pane-6` 首帧带 `mono-pane-enter`、`--mono-enter-x: 16px`、`animation-name: mono-pane-slide-in`、`transform: matrix(1,0,0,1,16,0)`、opacity 0.35；t=10/21/38/54/72/88/105/121/136ms 采样 opacity = 0.35/0.45/0.65/0.79/0.87/0.93/0.96/0.98/1.00，150ms 内收束。
+- **邻栏跟随**：同一组采样里 pane-1 308→226px、pane-2 157→225px 平滑变化（flex-grow 过渡），不是瞬跳；pane-1 的会话体全程在位（`body: true`），只有新栏被延迟。
+- **deferBody**：动画期间新栏 `body: false` 且 `empty: false`（连空态都不挂，标签条就位）；落定后 `enter: false`、`empty: true`，6 栏各 193px。
+- **减少动效**：`Emulation.setEmulatedMedia` 置 `prefers-reduced-motion: reduce` 后 `.mono-cell` 的 `transition-duration` 变 `0s`，新栏首帧（t=6ms）就是终态宽度、无 `mono-pane-enter`、空态立刻挂上；`anim: none`。
+- **与 T07 不打架**：sash 拖动中 `body.mono-sash-dragging` 让 `.mono-cell` 的 transition 归零，拖动中途宽度与松手后完全一致（`[360,184,272,272,272]` → `[360,184,272,272,272]`），指针仍 1:1。
+- 全程 `errs []`、`exc []`。
+
+实现中修掉一个自己引入的缺陷：抽出 `PaneLeaf` 后仍按旧写法只传 `props`，`paneId` 为 `undefined` → React 直接省略 `data-mono-pane` 属性（页面有栏、`[data-mono-pane]` 查不到），命中测试、持久化、TabStrip 全会跟着坏。改为 `h(PaneLeaf, { ...props, paneId: node.paneId })` 后消失。
+
+已知限制：
+1. **退出动画（滑出）没做**：关栏时布局树立即提交、React 当场卸载，要滑出就得留一层离场幽灵节点，属于 T09「关栏塌缩」的活，跟着那单元一起做（T09 的过关项已经包含「关中间那栏 → 两侧合并」）。
+2. **滑入方向只按「末端/非末端」推**：`splitPane`/`movePane` 新建的栏总是追加，所以够用；若将来出现「插到中间」的入口，`enterOffset` 需要拿到真实插入边（`EDGE_BEFORE` 已在 tree.js 里，接一下即可）。
+3. **重进 Mono 与首屏不播动画**（没有 `enter` 偏移就没有 `entering`），刻意如此，避免每次切面板整屏滑一下。
+4. **无头 Chrome 默认 `prefers-reduced-motion: reduce`**：headless 下看不到动画是浏览器默认值，不是代码失效；复验前先 `Emulation.setEmulatedMedia({ features: [{ name: "prefers-reduced-motion", value: "no-preference" }] })`。
 
 ---
 

@@ -140,6 +140,67 @@ function beginSashDrag(event, props, node, index, setPreview) {
   window.addEventListener("blur", sashBlur, true);
 }
 
+// ---- pane entry: slide in, then mount the heavy body -----------------------
+// T08. A pane a split just created slides in from its own edge while the split's
+// shares ease (CSS, .mono-cell); its body — the host conversation — mounts only
+// after the slide, so a large session cannot stall the animation. Reduced motion
+// skips both: no offset, body mounted immediately.
+const ENTER_MS = 150; // keep in step with the .mono-pane-enter duration in style.css
+
+const prefersReducedMotion = () => (
+  typeof window.matchMedia === "function"
+  && window.matchMedia("(prefers-reduced-motion: reduce)").matches === true
+);
+
+function PaneLeaf(props) {
+  const { paneId, enter } = props;
+  const active = props.activePaneId === paneId;
+  // panes can still hold the T03 shape; paneOf upgrades it on read.
+  const pane = paneOf(props.panes, paneId);
+  const tab = pane.tabs[pane.activeIndex];
+  // Read once: adding a sibling must not restart a pane's entry animation.
+  const [entering, setEntering] = react.useState(() => (
+    enter !== undefined && (enter.x !== 0 || enter.y !== 0) && !prefersReducedMotion()
+  ));
+  react.useEffect(() => {
+    if (!entering) return undefined;
+    const timer = window.setTimeout(() => setEntering(false), ENTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [entering]);
+  return h("div", {
+    className: entering ? "mono-pane mono-pane-enter" + (active ? " mono-pane-active" : "")
+      : active ? "mono-pane mono-pane-active" : "mono-pane",
+    "data-mono-pane": paneId,
+    style: entering ? { "--mono-enter-x": enter.x + "px", "--mono-enter-y": enter.y + "px" } : undefined,
+    onMouseDown: () => {
+      if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
+    },
+  },
+    h(TabStrip, {
+      paneId,
+      pane,
+      byId: props.byId,
+      ids: props.ids,
+      onPickSession: props.onPickSession,
+      onActivateTab: props.onActivateTab,
+      onCloseTab: props.onCloseTab,
+      onPromoteTab: props.onPromoteTab,
+      onOpenSession: props.onOpenSession,
+    }),
+    entering ? null : tab === undefined
+      ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
+      : h(Pane, {
+        // key: switching tabs must remount the native conversation, otherwise
+        // the SessionProvider keeps the old session's scope.
+        key: tab.sessionId,
+        sessionId: tab.sessionId,
+        sessions: props.sessions,
+        renderSlot: props.renderSlot,
+        renderFactorySlot: props.renderFactorySlot,
+        SessionProvider: props.SessionProvider,
+      }));
+}
+
 function PaneNode(props) {
   const { node } = props;
   // Preview sizes are local to this split; the committed tree is untouched
@@ -153,43 +214,7 @@ function PaneNode(props) {
   }, [splitId]);
   if (node === null || node === undefined) return h("div", { className: "mono-empty" }, "no layout");
 
-  if (node.type === "leaf") {
-    const paneId = node.paneId;
-    const active = props.activePaneId === paneId;
-    // panes can still hold the T03 shape; paneOf upgrades it on read.
-    const pane = paneOf(props.panes, paneId);
-    const tab = pane.tabs[pane.activeIndex];
-    return h("div", {
-      className: active ? "mono-pane mono-pane-active" : "mono-pane",
-      "data-mono-pane": paneId,
-      onMouseDown: () => {
-        if (!active && typeof props.onActivate === "function") props.onActivate(paneId);
-      },
-    },
-      h(TabStrip, {
-        paneId,
-        pane,
-        byId: props.byId,
-        ids: props.ids,
-        onPickSession: props.onPickSession,
-        onActivateTab: props.onActivateTab,
-        onCloseTab: props.onCloseTab,
-        onPromoteTab: props.onPromoteTab,
-        onOpenSession: props.onOpenSession,
-      }),
-      tab === undefined
-        ? h(PaneEmpty, { paneId, onOpenSession: props.onOpenSession })
-        : h(Pane, {
-          // key: switching tabs must remount the native conversation, otherwise
-          // the SessionProvider keeps the old session's scope.
-          key: tab.sessionId,
-          sessionId: tab.sessionId,
-          sessions: props.sessions,
-          renderSlot: props.renderSlot,
-          renderFactorySlot: props.renderFactorySlot,
-          SessionProvider: props.SessionProvider,
-        }));
-  }
+  if (node.type === "leaf") return h(PaneLeaf, { ...props, paneId: node.paneId });
 
   const count = node.children.length;
   // Sizes come normalized from the tree layer; fall back to an even split so a
@@ -204,7 +229,7 @@ function PaneNode(props) {
       key: "cell-" + index,
       className: "mono-cell",
       style: { flexGrow: sizes[index] },
-    }, h(PaneNode, { ...props, node: child })));
+    }, h(PaneNode, { ...props, node: child, enter: enterOffset(node.dir, index, count) })));
     if (index < count - 1) {
       // Sash size is fixed in flex-basis, so the shares stay the only variable.
       cells.push(h("div", {
